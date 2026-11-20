@@ -72,9 +72,10 @@ echo "  3) Single local file path (e.g. an unuploaded file on your system)"
 echo "  4) Check environment & scanners (doctor)"
 echo "  5) List built-in security rules (rules)"
 echo "  6) Run 90-second live demo (demo)"
-echo "  7) Enable automatic Git commit & push protection (install hooks in a repo)"
+echo "  7) Activate automatic Git commit & push protection (all repos, no path needed)"
 printf "Choose [1-7] or paste a Git URL / path directly: "
 IFS= read -r CHOICE
+CHOICE="$(printf '%s' "$CHOICE" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
 case "$CHOICE" in
   1)
     printf "Enter Git repository URL: "
@@ -99,14 +100,14 @@ case "$CHOICE" in
     exit 0
     ;;
   7)
-    printf "Enter local Git repository path (default: .): "
-    IFS= read -r REPO_PATH
-    exec "$VIBEGATE_BIN" hook install "${REPO_PATH:-.}" --which all
+    exec "$VIBEGATE_BIN" hook install --global --which all
     ;;
   *)
     TARGET="$CHOICE"
     ;;
 esac
+
+TARGET="$(printf '%s' "$TARGET" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
 
 if [ -z "$TARGET" ]; then
   echo "No target provided."

@@ -148,19 +148,67 @@ def cmd_scan(args: argparse.Namespace) -> int:
     return 1 if report.policy_blocked else 0
 
 
+def _hook_scripts() -> tuple[str, str]:
+    """Use sys.executable -m vibegate so hooks work in any repo even if .venv is not on PATH."""
+    py = sys.executable
+    pre_commit = f"#!/usr/bin/env sh\n{HOOK_MARKER}\nexec \"{py}\" -m vibegate scan --staged \"$@\"\n"
+    pre_push = f"#!/usr/bin/env sh\n{HOOK_MARKER}\nexec \"{py}\" -m vibegate scan --push\n"
+    return pre_commit, pre_push
+
+
 def cmd_hook(args: argparse.Namespace) -> int:
-    target_path = getattr(args, "path", ".") or "."
+    mode = getattr(args, "which", "all") or "all"
+    pre_commit, pre_push = _hook_scripts()
+    targets = []
+    if mode in ("all", "pre-commit"):
+        targets.append(("pre-commit", pre_commit))
+    if mode in ("all", "pre-push"):
+        targets.append(("pre-push", pre_push))
+
+    if getattr(args, "global_hooks", False):
+        import subprocess
+        from rich import box
+        from rich.panel import Panel
+        from rich.table import Table
+
+        console = Console()
+        hdir = os.path.expanduser("~/.vibegate-hooks")
+        if args.hook_action == "install":
+            console.print("\n[bold magenta]Activating VibeGate Global Git Protection...[/bold magenta]")
+            os.makedirs(hdir, exist_ok=True)
+            console.print(f"  [green]✓[/green] Prepared hooks directory: [cyan]{hdir}[/cyan]")
+            for name, script in targets:
+                hook_path = os.path.join(hdir, name)
+                with open(hook_path, "w", encoding="utf-8") as fh:
+                    fh.write(script)
+                os.chmod(hook_path, os.stat(hook_path).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+                role = "scans staged files before commit" if name == "pre-commit" else "scans commits & confirms before push"
+                console.print(f"  [green]✓[/green] Installed [bold]{name}[/bold] hook ({role})")
+            subprocess.run(["git", "config", "--global", "core.hooksPath", hdir], check=True)
+            console.print(f"  [green]✓[/green] Set [bold]git config --global core.hooksPath[/bold] -> [cyan]{hdir}[/cyan]")
+
+            grid = Table.grid(padding=(0, 2))
+            grid.add_column(style="bold", no_wrap=True)
+            grid.add_column()
+            grid.add_row("Status", "[bold green]ACTIVE (All local Git repositories)[/bold green]")
+            grid.add_row("On git commit", "Scans staged files; blocks & offers [A] auto-fix if risks found")
+            grid.add_row("On git push", "Scans outgoing commits; asks confirmation if 0 risks, blocks if vulnerable")
+            grid.add_row("Disable", "[dim]./run_app.sh hook uninstall --global[/dim]")
+            console.print(Panel(grid, title="VibeGate Git Guard", box=box.ROUNDED, border_style="green", expand=False))
+            return 0
+        if args.hook_action == "uninstall":
+            cur = subprocess.run(["git", "config", "--global", "--get", "core.hooksPath"], capture_output=True, text=True)
+            if cur.stdout.strip() == hdir:
+                subprocess.run(["git", "config", "--global", "--unset", "core.hooksPath"], check=False)
+            console.print("[yellow]Disabled global VibeGate Git commit & push protection.[/yellow]")
+            return 0
+
+    target_path = (getattr(args, "path", ".") or ".").strip()
     root = git.find_repo_root(os.path.abspath(target_path))
     if not root:
         print(f"Error: {target_path} is not inside a Git repository.", file=sys.stderr)
         return 2
     hdir = git.hooks_dir(root)
-    mode = getattr(args, "which", "all") or "all"
-    targets = []
-    if mode in ("all", "pre-commit"):
-        targets.append(("pre-commit", PRE_COMMIT_SCRIPT))
-    if mode in ("all", "pre-push"):
-        targets.append(("pre-push", PRE_PUSH_SCRIPT))
 
     if args.hook_action == "install":
         os.makedirs(hdir, exist_ok=True)
@@ -318,6 +366,7 @@ def build_parser() -> argparse.ArgumentParser:
     hook.add_argument("hook_action", choices=["install", "uninstall"])
     hook.add_argument("path", nargs="?", default=".", help="Git repository path (default: .)")
     hook.add_argument("--which", choices=["all", "pre-commit", "pre-push"], default="all", help="Which hook(s) to manage")
+    hook.add_argument("--global", dest="global_hooks", action="store_true", help="Enable/disable globally for all Git repos on this machine")
     hook.add_argument("--force", action="store_true", help="Overwrite an existing non-VibeGate hook")
     hook.set_defaults(func=cmd_hook)
 

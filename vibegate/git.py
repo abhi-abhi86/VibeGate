@@ -100,8 +100,9 @@ def user_identity(root: str | None) -> str:
 
 
 def hooks_dir(root: str) -> str:
-    out = _git(["rev-parse", "--git-path", "hooks"], cwd=root).strip()
-    return out if os.path.isabs(out) else os.path.join(root, out)
+    out = _git(["rev-parse", "--git-dir"], cwd=root).strip()
+    git_dir = out if os.path.isabs(out) else os.path.join(root, out)
+    return os.path.join(git_dir, "hooks")
 
 
 ZERO_SHA = "0" * 40
