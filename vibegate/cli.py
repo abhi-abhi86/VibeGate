@@ -16,7 +16,9 @@ from vibegate.config import CONFIG_FILE, DEFAULT_TOML, load_config
 from vibegate.engine import scan_remote_repo, scan_staged, scan_working_tree
 from vibegate.models import SEVERITIES
 from vibegate.scanners import ALL_SCANNERS
-from vibegate.ui import print_banner, render_summary, run_interactive
+from vibegate.scanners.semgrep import RULES_PATH
+from vibegate.suppress import SUPPRESS_FILE, load_suppressions
+from vibegate.ui import LiveScanDisplay, print_banner, render_summary, run_interactive
 
 HOOK_MARKER = "# vibegate-managed-pre-commit"
 HOOK_SCRIPT = f"""#!/usr/bin/env sh
@@ -25,18 +27,7 @@ exec vibegate scan --staged "$@"
 """
 
 
-def cmd_scan(args: argparse.Namespace) -> int:
-    if args.json:
-        progress_cb = None
-    else:
-        live_console = Console()
-        print_banner(live_console)
-        live_console.print("[bold magenta]VibeGate[/bold magenta] starting scan...")
-
-        def progress_cb(event: str, msg: str) -> None:
-            icon = "[green]✓[/green]" if event.endswith("_done") else "[cyan]•[/cyan]"
-            live_console.print(f"  {icon} {msg}")
-
+def _run_scan(args: argparse.Namespace, progress_cb) -> "ScanReport | int":
     target = (args.repo or args.path).strip()
     if git.is_git_url(target):
         cfg = load_config(None)
@@ -47,50 +38,71 @@ def cmd_scan(args: argparse.Namespace) -> int:
         if args.deps and "osv-scanner" not in cfg.scanners:
             cfg.scanners.append("osv-scanner")
         try:
-            report = scan_remote_repo(target, cfg, branch=args.branch, progress_cb=progress_cb)
+            return scan_remote_repo(target, cfg, branch=args.branch, progress_cb=progress_cb), cfg
         except git.GitError as exc:
             print(f"Error: {exc}", file=sys.stderr)
-            return 2
-    else:
-        cwd = os.path.abspath(target)
-        if not os.path.exists(cwd):
-            print(f"Error: path not found: {cwd}", file=sys.stderr)
-            return 2
-        if os.path.isfile(cwd):
-            cfg = load_config(os.path.dirname(cwd))
-            if args.fail_on:
-                cfg.fail_on = args.fail_on
-            if args.no_ai:
-                cfg.ai_enabled = False
-            if args.deps and "osv-scanner" not in cfg.scanners:
-                cfg.scanners.append("osv-scanner")
-            report = scan_working_tree(cwd, cfg, progress_cb=progress_cb)
-        else:
-            repo_root = git.find_repo_root(cwd)
-            cfg = load_config(repo_root or cwd)
-            if args.fail_on:
-                cfg.fail_on = args.fail_on
-            if args.no_ai:
-                cfg.ai_enabled = False
-            if args.deps and "osv-scanner" not in cfg.scanners:
-                cfg.scanners.append("osv-scanner")
+            return 2, cfg
 
-            if args.all or not repo_root or os.path.realpath(cwd) != os.path.realpath(repo_root):
-                report = scan_working_tree(cwd, cfg, progress_cb=progress_cb)
-            else:
-                report = scan_staged(repo_root, cfg, progress_cb=progress_cb)
+    cwd = os.path.abspath(target)
+    if not os.path.exists(cwd):
+        print(f"Error: path not found: {cwd}", file=sys.stderr)
+        return 2, load_config(None)
+    if os.path.isfile(cwd):
+        cfg = load_config(os.path.dirname(cwd))
+        if args.fail_on:
+            cfg.fail_on = args.fail_on
+        if args.no_ai:
+            cfg.ai_enabled = False
+        if args.deps and "osv-scanner" not in cfg.scanners:
+            cfg.scanners.append("osv-scanner")
+        return scan_working_tree(cwd, cfg, progress_cb=progress_cb), cfg
 
+    repo_root = git.find_repo_root(cwd)
+    cfg = load_config(repo_root or cwd)
+    if args.fail_on:
+        cfg.fail_on = args.fail_on
+    if args.no_ai:
+        cfg.ai_enabled = False
+    if args.deps and "osv-scanner" not in cfg.scanners:
+        cfg.scanners.append("osv-scanner")
+
+    if args.all or not repo_root or os.path.realpath(cwd) != os.path.realpath(repo_root):
+        return scan_working_tree(cwd, cfg, progress_cb=progress_cb), cfg
+    return scan_staged(repo_root, cfg, progress_cb=progress_cb), cfg
+
+
+def cmd_scan(args: argparse.Namespace) -> int:
     if args.json:
-        print(json.dumps(report.to_dict(), indent=2))
-    elif args.ci or args.no_tui:
-        console = Console(stderr=False)
+        result, cfg = _run_scan(args, None)
+        if isinstance(result, int):
+            return result
+        if args.output:
+            with open(args.output, "w", encoding="utf-8") as fh:
+                json.dump(result.to_dict(), fh, indent=2)
+                fh.write("\n")
+        print(json.dumps(result.to_dict(), indent=2))
+        return 1 if result.policy_blocked else 0
+
+    console = Console()
+    print_banner(console)
+    with LiveScanDisplay(console) as live:
+        result, cfg = _run_scan(args, live.update)
+    if isinstance(result, int):
+        return result
+
+    report = result
+    if args.output:
+        with open(args.output, "w", encoding="utf-8") as fh:
+            json.dump(report.to_dict(), fh, indent=2)
+            fh.write("\n")
+        console.print(f"[dim]Saved JSON report to {args.output}[/dim]")
+    if args.ci or args.no_tui:
         render_summary(report, console)
         if report.policy_blocked:
             console.print("\n[bold red]BLOCKED:[/bold red] " + "; ".join(report.block_reasons))
         else:
             console.print("\n[bold green]PASS:[/bold green] no policy-blocking findings.")
     else:
-        console = Console()
         report = run_interactive(report, cfg, console)
         if report.policy_blocked:
             console.print("\n[bold red]COMMIT BLOCKED:[/bold red] " + "; ".join(report.block_reasons))
@@ -160,6 +172,74 @@ def cmd_doctor(_args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_rules(_args: argparse.Namespace) -> int:
+    """List built-in cybersecurity detection rules."""
+    import re
+    from rich.table import Table
+
+    console = Console()
+    with open(RULES_PATH, encoding="utf-8") as fh:
+        raw = fh.read()
+
+    # Parse rule blocks cleanly without requiring PyYAML as a runtime dependency
+    blocks = re.split(r"(?m)^\s*-\s+id:\s*", raw)[1:]
+    table = Table(title=f"Built-in Semgrep Rules ({len(blocks)})", header_style="bold")
+    table.add_column("Rule ID", style="cyan", no_wrap=True)
+    table.add_column("Severity", no_wrap=True)
+    table.add_column("Category", no_wrap=True)
+    table.add_column("CWE", overflow="fold")
+    table.add_column("Title", overflow="fold")
+
+    for b in blocks:
+        lines = b.splitlines()
+        rid = lines[0].strip()
+        sev = re.search(r"vibegate_severity:\s*(\S+)", b)
+        cat = re.search(r"vibegate_category:\s*(\S+)", b)
+        cwe = re.search(r'cwe:\s*"?([^"\n]+)"?', b)
+        title = re.search(r"title:\s*(.+)", b)
+        table.add_row(
+            rid,
+            (sev.group(1) if sev else "medium").upper(),
+            cat.group(1) if cat else "other",
+            cwe.group(1).strip() if cwe else "-",
+            title.group(1).strip() if title else rid,
+        )
+    console.print(table)
+    return 0
+
+
+def cmd_suppressions(args: argparse.Namespace) -> int:
+    """Inspect or clear repository suppressions in .vibegate-ignore.json."""
+    from rich.table import Table
+
+    root = git.find_repo_root(".") or os.getcwd()
+    path = os.path.join(root, SUPPRESS_FILE)
+    if args.sup_action == "clear":
+        if os.path.exists(path):
+            os.remove(path)
+            print(f"Removed {path}")
+        else:
+            print("No suppression file found.")
+        return 0
+
+    sups = load_suppressions(root)
+    if not sups:
+        print(f"No active suppressions in {root}.")
+        return 0
+    console = Console()
+    table = Table(title=f"Suppressions ({SUPPRESS_FILE})", header_style="bold")
+    table.add_column("Rule ID", style="cyan")
+    table.add_column("Location")
+    table.add_column("Reason")
+    table.add_column("Added By")
+    table.add_column("Added At")
+    for s in sups:
+        loc = f"{s.file}:{s.line}" if s.line else s.file
+        table.add_row(s.rule_id, loc, s.reason, s.added_by, s.added_at)
+    console.print(table)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="vibegate", description="Local-first security gate for AI-generated code.")
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -176,6 +256,7 @@ def build_parser() -> argparse.ArgumentParser:
     scan.add_argument("--no-tui", action="store_true", help="Print summary without interactive prompt")
     scan.add_argument("--no-ai", action="store_true", help="Disable AI-assisted authorization review")
     scan.add_argument("--deps", action="store_true", help="Also scan dependency manifests/lockfiles with OSV-Scanner")
+    scan.add_argument("--output", "-o", help="Save JSON scan report to a file")
     scan.add_argument("--fail-on", choices=SEVERITIES, help="Override blocking severity threshold")
     scan.set_defaults(func=cmd_scan)
 
@@ -190,6 +271,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     doc = sub.add_parser("doctor", help="Check installed scanners and environment")
     doc.set_defaults(func=cmd_doctor)
+
+    rules = sub.add_parser("rules", help="List built-in cybersecurity detection rules")
+    rules.set_defaults(func=cmd_rules)
+
+    sups = sub.add_parser("suppressions", help="List or clear .vibegate-ignore.json suppressions")
+    sups.add_argument("sup_action", nargs="?", choices=["list", "clear"], default="list")
+    sups.set_defaults(func=cmd_suppressions)
     return p
 
 

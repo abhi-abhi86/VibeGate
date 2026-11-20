@@ -10,10 +10,11 @@ CATEGORIES = ["secret", "injection", "access_control", "dependency", "other"]
 CONFIDENCES = ["low", "medium", "high"]
 
 # verification_status values
-NOT_RECHECKED = "not_rechecked"
+DETECTED = "detected"
+NOT_RECHECKED = DETECTED  # backwards-compatible alias
 NO_LONGER_REPRODUCES = "no_longer_reproduces"
 STILL_REPRODUCES = "still_reproduces"
-AI_CANDIDATE = "ai_candidate_unverified"
+AI_CANDIDATE = "ai_candidate"
 AI_PATCH_APPLIED = "ai_patch_applied_unverified"
 TESTS_PASSED = "patched_tests_passed"
 TESTS_FAILED = "patched_tests_failed"

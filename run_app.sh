@@ -13,7 +13,7 @@ fi
 
 if [ "$#" -gt 0 ]; then
   case "$1" in
-    scan|hook|init|doctor|-h|--help|--version)
+    scan|hook|init|doctor|rules|suppressions|-h|--help|--version)
       exec "$VIBEGATE_BIN" "$@"
       ;;
     *)
@@ -36,7 +36,9 @@ echo "Scan a target for vulnerabilities:"
 echo "  1) Git repository URL (clones temporarily, scans all files, then deletes the clone)"
 echo "  2) Local project folder / downloaded directory"
 echo "  3) Single local file path (e.g. an unuploaded file on your system)"
-printf "Choose [1/2/3] or paste a Git URL / path directly: "
+echo "  4) Check environment & scanners (doctor)"
+echo "  5) List built-in security rules (rules)"
+printf "Choose [1/2/3/4/5] or paste a Git URL / path directly: "
 IFS= read -r CHOICE
 case "$CHOICE" in
   1)
@@ -50,6 +52,12 @@ case "$CHOICE" in
   3)
     printf "Enter local file path: "
     IFS= read -r TARGET
+    ;;
+  4)
+    exec "$VIBEGATE_BIN" doctor
+    ;;
+  5)
+    exec "$VIBEGATE_BIN" rules
     ;;
   *)
     TARGET="$CHOICE"

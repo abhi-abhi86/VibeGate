@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 
-from rich.console import Console
+from rich.console import Console, Group
+from rich.live import Live
 from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
+from rich.spinner import Spinner
 from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
@@ -33,6 +36,17 @@ SEV_STYLE = {
     "info": "dim",
 }
 
+STATUS_LABELS = {
+    "detected": "detected",
+    "not_rechecked": "detected",
+    "ai_candidate": "ai candidate",
+    "ai_candidate_unverified": "ai candidate",
+    "no_longer_reproduces": "fixed (rescan ok)",
+    "still_reproduces": "still triggers",
+    "patched_tests_passed": "patched (tests ok)",
+    "patched_tests_failed": "patched (tests fail)",
+}
+
 BANNER = r"""[bold magenta]
  __     ___ _           ____       _       
  \ \   / (_) |__   ___ / ___| __ _| |_ ___ 
@@ -44,6 +58,49 @@ BANNER = r"""[bold magenta]
 
 def print_banner(console: Console) -> None:
     console.print(BANNER)
+
+
+class LiveScanDisplay:
+    """Real-time TUI progress panel during cloning, scanning, AI review, and cleanup."""
+
+    def __init__(self, console: Console) -> None:
+        self.console = console
+        self.phase = "Preparing scan..."
+        self.steps: list[tuple[str, str]] = []  # (status_icon, message)
+        self._lock = threading.Lock()
+        self._live: Live | None = None
+
+    def __enter__(self) -> "LiveScanDisplay":
+        if self.console.is_terminal:
+            self._live = Live(self._render(), console=self.console, refresh_per_second=10, transient=True)
+            self._live.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self._live is not None:
+            self._live.__exit__(exc_type, exc, tb)
+        # Print a concise final progress summary so the steps remain visible above the report
+        for icon, msg in self.steps:
+            self.console.print(f"  {icon} {msg}")
+
+    def update(self, event: str, msg: str) -> None:
+        with self._lock:
+            if event in ("clone_start", "scanners_start", "ai_start"):
+                self.phase = msg
+                self.steps.append(("[cyan]•[/cyan]", msg))
+            elif event in ("clone_done", "scanner_done", "ai_done", "cleanup_done"):
+                self.steps.append(("[green]✓[/green]", msg))
+            else:
+                self.steps.append(("[dim]•[/dim]", msg))
+            if self._live is not None:
+                self._live.update(self._render())
+
+    def _render(self) -> Panel:
+        spinner = Spinner("dots", text=Text(f" {self.phase}", style="bold cyan"))
+        lines = [spinner]
+        for icon, msg in self.steps[-8:]:
+            lines.append(Text.from_markup(f"  {icon} {msg}"))
+        return Panel(Group(*lines), title="VibeGate Live Scan", border_style="magenta", expand=False)
 
 
 def _open_tty_input():
@@ -91,6 +148,17 @@ def render_summary(report: ScanReport, console: Console) -> None:
         console.print("[green]No findings reported.[/green]")
         return
 
+    counts: dict[str, int] = {}
+    for f in report.active_findings:
+        counts[f.severity] = counts.get(f.severity, 0) + 1
+    if counts:
+        sev_bar = "  ".join(
+            f"[{SEV_STYLE.get(s, '')}]{s.upper()}: {counts[s]}[/{SEV_STYLE.get(s, '')}]"
+            for s in ("critical", "high", "medium", "low", "info")
+            if counts.get(s)
+        )
+        console.print(f"Active threats: {sev_bar}")
+
     table = Table(title="Findings Summary", show_lines=False, header_style="bold")
     table.add_column("#", style="dim", no_wrap=True)
     table.add_column("Severity", no_wrap=True)
@@ -101,7 +169,7 @@ def render_summary(report: ScanReport, console: Console) -> None:
 
     for idx, f in enumerate(report.findings, 1):
         sev = Text(f.severity.upper(), style=SEV_STYLE.get(f.severity, ""))
-        status = f.verification_status
+        status = STATUS_LABELS.get(f.verification_status, f.verification_status)
         if f.suppressed:
             status = "suppressed"
         elif f.dismissed:

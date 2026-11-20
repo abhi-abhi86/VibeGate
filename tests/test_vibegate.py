@@ -208,3 +208,15 @@ def test_scan_single_local_file_and_downloaded_folder(tmp_path):
     r_dir = scan_working_tree(str(folder), Config(scanners=["gitleaks"], ai_enabled=False))
     assert r_dir.files_scanned == ["local_model.py"]
     assert r_dir.scanned_version == "directory"
+
+
+def test_cli_rules_and_doctor(capsys):
+    assert cli_main(["rules"]) == 0
+    out = capsys.readouterr().out
+    assert "python-sql-injection-fstring" in out
+    assert "python-ssrf-requests" in out
+
+    assert cli_main(["doctor"]) == 0
+    doc_out = capsys.readouterr().out
+    assert "gitleaks:" in doc_out
+    assert "semgrep:" in doc_out
