@@ -215,7 +215,7 @@ def _render_detail_panel(idx: int, f: Finding, report: ScanReport, console: Cons
     )
 
 
-def render_summary(report: ScanReport, console: Console) -> None:
+def render_summary(report: ScanReport, console: Console, sev_filter: str | None = None) -> None:
     console.print()
     active_count = len(report.active_findings)
     crit_high = sum(1 for f in report.active_findings if f.severity in ("critical", "high"))
@@ -281,8 +281,16 @@ def render_summary(report: ScanReport, console: Console) -> None:
         console.print("[green]No findings reported.[/green]")
         return
 
-    code_rows = [(idx, f) for idx, f in enumerate(report.findings, 1) if f.category != "dependency"]
-    dep_rows = [(idx, f) for idx, f in enumerate(report.findings, 1) if f.category == "dependency"]
+    findings_iter = [
+        (idx, f)
+        for idx, f in enumerate(report.findings, 1)
+        if not sev_filter or sev_filter == "all" or f.severity == sev_filter
+    ]
+    code_rows = [(idx, f) for idx, f in findings_iter if f.category != "dependency"]
+    dep_rows = [(idx, f) for idx, f in findings_iter if f.category == "dependency"]
+
+    if sev_filter and sev_filter != "all":
+        console.print(f"[cyan]Filter active:[/cyan] showing [bold]{sev_filter.upper()}[/bold] findings ({len(findings_iter)}/{len(report.findings)}).")
 
     if code_rows:
         table = Table(
@@ -436,8 +444,21 @@ def _handle_patch(finding: Finding, report: ScanReport, cfg: Config, console: Co
         console.print(f"[green]Staged {proposal.file}.[/green]")
 
 
+def _render_command_bar(console: Console, sev_filter: str) -> None:
+    bar = (
+        "[bold green][A][/bold green] Auto-fix all & re-stage   "
+        "[bold yellow][I][/bold yellow] Ignore updates   "
+        f"[bold cyan][F][/bold cyan] Filter ({sev_filter})   "
+        "[bold magenta][1-N][/bold magenta] Inspect   "
+        "[bold][R][/bold] Refresh   "
+        "[bold red][Q][/bold red] Finish"
+    )
+    console.print(Panel(bar, title="TUI Actions", box=box.ROUNDED, border_style="cyan", expand=False))
+
+
 def run_interactive(report: ScanReport, cfg: Config, console: Console) -> ScanReport:
-    render_summary(report, console)
+    sev_filter = "all"
+    render_summary(report, console, sev_filter=sev_filter)
     if not report.findings:
         return report
 
@@ -447,13 +468,35 @@ def run_interactive(report: ScanReport, cfg: Config, console: Console) -> ScanRe
 
     try:
         while True:
-            console.print(
-                "\nActions: [bold][A][/bold] Apply all safe fixes & re-stage, "
-                "[bold]<number>[/bold] inspect finding, [bold]r[/bold] refresh, [bold]q[/bold] finish"
-            )
+            _render_command_bar(console, sev_filter)
             choice = Prompt.ask("vibegate", default="q", console=console, stream=tty).strip().lower()
             if choice in ("q", "quit", "exit", ""):
                 break
+            if choice == "f":
+                sev_filter = Prompt.ask(
+                    "Filter by severity",
+                    choices=["all", "critical", "high", "medium", "low", "info"],
+                    case_sensitive=False,
+                    default="all",
+                    console=console,
+                    stream=tty,
+                ).strip().lower()
+                if console.is_terminal:
+                    console.clear()
+                render_summary(report, console, sev_filter=sev_filter)
+                continue
+            if choice == "i":
+                dep_active = [f for f in report.active_findings if f.category == "dependency"]
+                if not dep_active:
+                    console.print("[dim]No active dependency update suggestions to ignore.[/dim]")
+                    continue
+                for f in dep_active:
+                    f.dismissed = True
+                    f.dismiss_note = "update suggestion ignored by developer"
+                effective = [f for f in report.findings if f.verification_status != "no_longer_reproduces"]
+                report.policy_blocked, report.block_reasons = evaluate_policy(effective, report.scanner_results, cfg)
+                console.print(f"[yellow]Ignored {len(dep_active)} package update suggestion(s) for this run.[/yellow]")
+                continue
             if choice == "a":
                 if report.scanned_version.startswith("git:"):
                     console.print("[yellow]Remote repo clones are temporary; auto-patch is only available for local paths.[/yellow]")
@@ -469,7 +512,6 @@ def run_interactive(report: ScanReport, cfg: Config, console: Console) -> ScanRe
                     console.print(f"  [green]✓ Fixed[/green] {prop.file}: {prop.description}")
                 for msg in skipped:
                     console.print(f"  [yellow]• Skipped[/yellow] {msg}")
-                # Rescan each finding to verify
                 for f in report.active_findings:
                     if f.source in ("gitleaks", "semgrep", "osv-scanner"):
                         verify_finding_recheck(report.target_root, f, timeout=cfg.scanner_timeout)
@@ -481,19 +523,23 @@ def run_interactive(report: ScanReport, cfg: Config, console: Console) -> ScanRe
                 )
                 continue
             if choice == "r":
-                render_summary(report, console)
+                if console.is_terminal:
+                    console.clear()
+                render_summary(report, console, sev_filter=sev_filter)
                 continue
             if not choice.isdigit() or not (1 <= int(choice) <= len(report.findings)):
                 console.print("[red]Invalid selection.[/red]")
                 continue
 
-            finding = report.findings[int(choice) - 1]
-            _show_finding_detail(finding, console)
+            cur_idx = int(choice) - 1
+            while 0 <= cur_idx < len(report.findings):
+                finding = report.findings[cur_idx]
+                console.print(f"\n[dim]Finding {cur_idx + 1} of {len(report.findings)}[/dim]")
+                _show_finding_detail(finding, console)
 
-            while True:
                 action = Prompt.ask(
-                    "Finding action: [p]atch, [s]uppress (.vibegate-ignore.json), [d]ismiss for this run, [b]ack",
-                    choices=["p", "s", "d", "b"],
+                    "Action: [p]atch, [i]gnore, [s]uppress, [n]ext, [v]prev, [b]ack",
+                    choices=["p", "i", "s", "n", "v", "b"],
                     case_sensitive=False,
                     default="b",
                     console=console,
@@ -501,17 +547,32 @@ def run_interactive(report: ScanReport, cfg: Config, console: Console) -> ScanRe
                 ).strip().lower()
                 if action == "b":
                     break
+                if action == "n":
+                    if cur_idx + 1 < len(report.findings):
+                        cur_idx += 1
+                    else:
+                        console.print("[dim]Already at the last finding.[/dim]")
+                    continue
+                if action == "v":
+                    if cur_idx > 0:
+                        cur_idx -= 1
+                    else:
+                        console.print("[dim]Already at the first finding.[/dim]")
+                    continue
                 if action == "p":
                     if report.scanned_version.startswith("git:"):
                         console.print("[yellow]Remote repo clones are temporary and already deleted; patching is only available for local paths.[/yellow]")
                         continue
                     _handle_patch(finding, report, cfg, console, tty)
-                elif action == "d":
-                    note = Prompt.ask("Reason for dismissing this run", default="reviewed", console=console, stream=tty)
+                elif action == "i":
+                    note = Prompt.ask("Reason for ignoring this suggestion", default="update suggestion ignored", console=console, stream=tty)
                     finding.dismissed = True
                     finding.dismiss_note = note
-                    console.print("[yellow]Dismissed for this run.[/yellow]")
-                    break
+                    console.print("[yellow]Ignored suggestion for this run.[/yellow]")
+                    if cur_idx + 1 < len(report.findings):
+                        cur_idx += 1
+                    else:
+                        break
                 elif action == "s":
                     if report.scanned_version.startswith("git:") or not os.path.isdir(report.target_root):
                         console.print("[red]Cannot write suppression file for a temporary/remote clone.[/red]")

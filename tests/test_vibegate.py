@@ -299,3 +299,18 @@ def test_pre_push_hook_install_and_scan_push(tmp_path, monkeypatch):
     assert report.policy_blocked is True
     assert len(report.findings) == 1
     assert report.findings[0].file == "leak.py"
+
+
+def test_ignore_update_suggestion_unblocks_policy():
+    from vibegate.engine import ScanReport, evaluate_policy
+    from vibegate.ai import AIReviewResult
+
+    dep = Finding("osv-scanner", "GHSA-test", "dependency", "high", "high", "requirements.txt", 1, 1, "PyYAML", "", "", "Upgrade PyYAML")
+    cfg = Config()
+    blocked, _ = evaluate_policy([dep], [], cfg)
+    assert blocked is True
+
+    dep.dismissed = True
+    dep.dismiss_note = "update suggestion ignored by developer"
+    blocked_after, _ = evaluate_policy([dep], [], cfg)
+    assert blocked_after is False
