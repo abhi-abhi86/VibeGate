@@ -11,7 +11,9 @@
 
 A local-first security gate for AI-generated code. VibeGate scans **remote Git repositories**, **local/downloaded folders**, **single unuploaded files**, or **staged Git changes** before a commit—combining deterministic cybersecurity scanners (**Gitleaks**, **Semgrep**) with an optional **Gemini** authorization review for context-dependent access-control gaps (like IDORs).
 
-VibeGate does not claim to prove code is secure; it helps catch high-signal cybersecurity threats early, shows the exact file, line, and code snippet, explains each issue in plain English, lets you review diffs before applying a fix, and reruns the relevant check after a change.
+VibeGate does not claim to prove code is secure; it helps catch high-signal cybersecurity threats early, shows the exact file, line, and pinpointed code snippet, explains the **Threat / Impact** in plain English, supports one-keystroke auto-fixing (`[A] Apply all safe fixes & re-stage`), and reruns checks after a change.
+
+![VibeGate Terminal Output](docs/vibegate-demo.jpg)
 
 ## Quick Start
 
@@ -27,6 +29,7 @@ The interactive menu lets you choose:
 3. **Single local file** (for testing unuploaded files on your system)
 4. **Environment check** (`doctor`)
 5. **Built-in security rules** (`rules`)
+6. **90-second live demo** (`./run_app.sh demo`)
 
 You can also pass a target directly:
 

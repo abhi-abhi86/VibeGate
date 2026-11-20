@@ -43,8 +43,11 @@ class GitleaksScanner(Scanner):
 
     def normalize(self, items: list[dict], target: ScanTarget) -> list[Finding]:
         findings = []
+        allowed = set(target.files) if target.files else None
         for it in items or []:
             rel = self.rel(it.get("File", ""), target)
+            if allowed is not None and rel not in allowed:
+                continue
             rule = it.get("RuleID", "secret")
             secret = it.get("Secret", "") or ""
             start = int(it.get("StartLine") or 0)

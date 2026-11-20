@@ -231,8 +231,8 @@ def render_summary(report: ScanReport, console: Console) -> None:
     table.add_column("#", style="dim", no_wrap=True)
     table.add_column("Severity", no_wrap=True)
     table.add_column("Source", no_wrap=True)
-    table.add_column("Location", style="cyan")
-    table.add_column("Title")
+    table.add_column("Location", style="cyan", no_wrap=True)
+    table.add_column("Title", overflow="fold")
     table.add_column("Status", no_wrap=True)
 
     for idx, f in enumerate(report.findings, 1):
@@ -256,11 +256,17 @@ def render_summary(report: ScanReport, console: Console) -> None:
             if f.suppressed or f.dismissed:
                 continue
             sev_style = SEV_STYLE.get(f.severity, "white")
+            full_path = os.path.join(report.target_root, f.file) if os.path.isdir(report.target_root) else f.file
+            line_info = f"Line {f.start_line}" if f.start_line else "File-level"
+            if f.end_line and f.end_line != f.start_line:
+                line_info = f"Lines {f.start_line}-{f.end_line}"
+            snippet = _pinpoint_code(report.target_root, f)
             body = (
-                f"[bold]File:[/bold] [cyan]{f.location}[/cyan]   "
+                f"[bold]File:[/bold] [cyan]{f.location}[/cyan] ({line_info})   "
                 f"[bold]Rule:[/bold] {f.rule_id}   "
                 f"[bold]Source:[/bold] {f.source_label}\n"
-                f"[bold]Code / Evidence:[/bold]\n{f.evidence or '(none)'}\n\n"
+                f"[bold]Path:[/bold] [dim]{full_path}[/dim]\n"
+                f"[bold]Pinpointed Code:[/bold]\n{snippet}\n\n"
                 f"[bold]Issue:[/bold] {f.explanation}\n"
                 f"[bold red]Threat / Impact:[/bold red] {threat_impact(f)}\n"
                 f"[bold]Fix:[/bold] {f.remediation}"
@@ -273,6 +279,27 @@ def render_summary(report: ScanReport, console: Console) -> None:
                     expand=False,
                 )
             )
+
+
+def _pinpoint_code(root: str, finding: Finding) -> str:
+    """Return a line-numbered code snippet pinpointing the exact vulnerable line(s)."""
+    if finding.category == "secret" or not finding.start_line:
+        return finding.evidence or "(none)"
+    path = os.path.join(root, finding.file)
+    if not os.path.isfile(path):
+        return finding.evidence or "(none)"
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return finding.evidence or "(none)"
+    lo = max(1, finding.start_line - 1)
+    hi = min(len(lines), max(finding.start_line, finding.end_line) + 1)
+    out = []
+    for ln_no in range(lo, hi + 1):
+        marker = ">>" if finding.start_line <= ln_no <= max(finding.start_line, finding.end_line) else "  "
+        out.append(f"{marker} {ln_no:>4} | {lines[ln_no - 1]}")
+    return "\n".join(out) if out else (finding.evidence or "(none)")
 
 
 def _show_finding_detail(finding: Finding, console: Console) -> None:
