@@ -133,3 +133,58 @@ def checkout_commit(root: str, commit_sha: str, files: list[str], dest: str) -> 
         with open(out_path, "wb") as fh:
             fh.write(proc.stdout)
 
+
+def list_remote_branches_and_prs(repo_dir: str, max_branches: int = 10, max_prs: int = 10) -> list[tuple[str, str]]:
+    """Return [(label, sha), ...] for branches and pull/merge requests on origin (newest PRs first)."""
+    out = _git(["ls-remote", "origin"], cwd=repo_dir, check=False)
+    branches: list[tuple[str, str]] = []
+    prs: list[tuple[int, str, str]] = []
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        sha, ref = parts[0], parts[1]
+        if ref.startswith("refs/heads/"):
+            name = ref[len("refs/heads/") :]
+            if len(branches) < max_branches:
+                branches.append((f"branch:{name}", sha))
+        elif ref.startswith("refs/pull/") and ref.endswith("/head"):
+            try:
+                num = int(ref.split("/")[2])
+            except ValueError:
+                continue
+            prs.append((num, f"PR #{num}", sha))
+        elif ref.startswith("refs/merge-requests/") and ref.endswith("/head"):
+            try:
+                num = int(ref.split("/")[2])
+            except ValueError:
+                continue
+            prs.append((num, f"MR !{num}", sha))
+    prs.sort(key=lambda item: item[0], reverse=True)
+    return branches + [(label, sha) for _, label, sha in prs[:max_prs]]
+
+
+def fetch_commit(repo_dir: str, sha: str) -> bool:
+    proc = subprocess.run(["git", "fetch", "--depth", "1", "origin", sha], cwd=repo_dir, capture_output=True, text=True)
+    return proc.returncode == 0
+
+
+def changed_files_for_ref(repo_dir: str, base_sha: str, target_sha: str) -> list[str]:
+    """Return only files added/modified in target_sha vs base_sha (or in target_sha's commit if shallow)."""
+    proc = subprocess.run(
+        ["git", "diff", "--name-only", "--diff-filter=ACMR", "-z", base_sha, target_sha],
+        cwd=repo_dir,
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode == 0:
+        return _split_z(proc.stdout)
+    # Fallback for shallow clones where base_sha and target_sha have no common ancestor
+    proc2 = subprocess.run(
+        ["git", "diff-tree", "--no-commit-id", "--name-only", "--diff-filter=ACMR", "-r", "-z", target_sha],
+        cwd=repo_dir,
+        capture_output=True,
+        text=True,
+    )
+    return _split_z(proc2.stdout) if proc2.returncode == 0 else []
+

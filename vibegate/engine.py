@@ -27,6 +27,7 @@ class ScanReport:
     scanner_results: list[ScannerResult]
     ai_result: AIReviewResult
     suppressions_loaded: list[Suppression] = field(default_factory=list)
+    ref_summaries: list[dict] = field(default_factory=list)
     duration_ms: int = 0
     policy_fail_on: str = "high"
     policy_blocked: bool = False
@@ -59,6 +60,7 @@ class ScanReport:
                 "active_findings": len(self.active_findings),
                 "suppressed_or_dismissed": len(self.suppressed_findings),
             },
+            "ref_summaries": self.ref_summaries,
             "findings": [f.to_dict() for f in self.findings],
         }
 
@@ -211,11 +213,65 @@ def scan_remote_repo(
     with tempfile.TemporaryDirectory(prefix="vibegate-repo-") as td:
         td_path = td
         git.clone_repo(url, td, branch=branch)
+        head_sha = git._git(["rev-parse", "HEAD"], cwd=td, check=False).strip()
+        head_branch = git._git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=td, check=False).strip() or "HEAD"
         files = git.listed_files(td)
         if progress_cb:
-            progress_cb("clone_done", f"Cloned {len(files)} file(s) from {url}")
-        target = ScanTarget(root=td, files=files, version=f"git:{url}")
+            progress_cb("clone_done", f"Cloned {len(files)} file(s) from {url} ({head_branch})")
+
+        target = ScanTarget(root=td, files=files, version=f"branch:{head_branch}")
         report = _run_on_target(target, None, [], cfg, start, progress_cb=progress_cb)
+        ref_summaries = [
+            {
+                "ref": f"branch:{head_branch} (default)",
+                "sha": head_sha[:7],
+                "finding_count": len(report.active_findings),
+            }
+        ]
+
+        if not branch:
+            all_refs = git.list_remote_branches_and_prs(td)
+            seen_shas = {head_sha: f"branch:{head_branch}"}
+            all_findings = list(report.findings)
+            for label, sha in all_refs:
+                if sha in seen_shas:
+                    if label != f"branch:{head_branch}":
+                        ref_summaries.append({"ref": label, "sha": sha[:7], "finding_count": len(report.active_findings), "note": f"same commit as {seen_shas[sha]}"})
+                    continue
+                if progress_cb:
+                    progress_cb("ref_scan", f"Checking changed files in {label} ({sha[:7]})...")
+                if not git.fetch_commit(td, sha):
+                    continue
+                seen_shas[sha] = label
+                changed = git.changed_files_for_ref(td, head_sha, sha)
+                if not changed:
+                    ref_summaries.append({"ref": label, "sha": sha[:7], "finding_count": 0, "note": "no changed files"})
+                    continue
+                with tempfile.TemporaryDirectory(prefix="vibegate-ref-") as ref_td:
+                    git.checkout_commit(td, sha, changed, ref_td)
+                    ref_target = ScanTarget(root=ref_td, files=changed, version=label)
+                    ref_report = _run_on_target(ref_target, None, [], cfg, start, progress_cb=None)
+                ref_summaries.append(
+                    {
+                        "ref": label,
+                        "sha": sha[:7],
+                        "finding_count": len(ref_report.active_findings),
+                        "note": f"{len(changed)} changed file(s)",
+                    }
+                )
+                # Add findings from this branch/PR that weren't already reported at the exact same location
+                existing_keys = {(f.rule_id, f.file, f.start_line) for f in all_findings}
+                for rf in ref_report.findings:
+                    if (rf.rule_id, rf.file, rf.start_line) not in existing_keys:
+                        all_findings.append(rf)
+
+            all_findings.sort(key=lambda f: (1 if f.category == "dependency" else 0, -sev_rank(f.severity), f.file, f.start_line))
+            report.findings = all_findings
+            report.ref_summaries = ref_summaries
+            report.scanned_version = f"git:{url}"
+            report.policy_blocked, report.block_reasons = evaluate_policy(all_findings, report.scanner_results, cfg)
+            report.duration_ms = int((time.monotonic() - start) * 1000)
+
     if progress_cb:
         progress_cb("cleanup_done", f"Deleted temporary cloned repo ({td_path})")
     return report

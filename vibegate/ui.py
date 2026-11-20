@@ -277,6 +277,23 @@ def render_summary(report: ScanReport, console: Console, sev_filter: str | None 
 
     console.print(Panel(summary_grid, title="[bold magenta]VibeGate Report[/bold magenta]", box=box.ROUNDED, border_style=border, expand=False))
 
+    if report.ref_summaries:
+        ref_table = Table(
+            title="Branches & Pull Requests Checked",
+            box=box.ROUNDED,
+            border_style="bright_cyan",
+            header_style="bold white on #003f88",
+        )
+        ref_table.add_column("Branch / PR", style="cyan", no_wrap=True)
+        ref_table.add_column("Commit", style="dim", no_wrap=True)
+        ref_table.add_column("Status", no_wrap=True)
+        ref_table.add_column("Note")
+        for rs in report.ref_summaries:
+            cnt = rs.get("finding_count", 0)
+            st = f"[bold red]VULNERABLE ({cnt})[/bold red]" if cnt > 0 else "[bold green]CLEAN (0)[/bold green]"
+            ref_table.add_row(rs["ref"], rs["sha"], st, rs.get("note", ""))
+        console.print(ref_table)
+
     if report.partially_staged_files:
         console.print(
             "[yellow]Notice:[/yellow] Partially staged file(s): "
@@ -288,6 +305,55 @@ def render_summary(report: ScanReport, console: Console, sev_filter: str | None 
             console.print(f"[yellow]{sr.name} note:[/yellow] {sr.message.splitlines()[-1]}")
     if ai.status not in ("ok", "skipped") and ai.message:
         console.print(f"[yellow]AI review note:[/yellow] {ai.message}")
+
+    if not report.policy_blocked:
+        reasons_ok: list[str] = [
+            f"Scanned {len(report.files_scanned)} file(s) with policy threshold >= '{report.policy_fail_on}'."
+        ]
+        for sr in report.scanner_results:
+            if sr.status == "ok":
+                reasons_ok.append(f"{sr.name}: passed ({len(sr.findings)} finding(s) in {sr.duration_ms}ms).")
+            elif sr.status == "skipped":
+                reasons_ok.append(f"{sr.name}: skipped ({sr.message or 'not applicable'}).")
+        if ai.status == "ok" and not ai.findings:
+            reasons_ok.append(f"ai-review ({ai.consensus_status}): {ai.message}.")
+        elif ai.status != "ok":
+            reasons_ok.append(f"ai-review: {ai.status} ({ai.message}).")
+        if report.suppressed_findings:
+            reasons_ok.append(f"{len(report.suppressed_findings)} finding(s) suppressed or ignored by developer.")
+        console.print(
+            Panel(
+                "\n".join(f"[green]✓[/green] {r}" for r in reasons_ok),
+                title="[bold green]Why It Passed[/bold green]",
+                box=box.ROUNDED,
+                border_style="green",
+                expand=False,
+            )
+        )
+
+    if ai.reasoning_trace:
+        topic_labels = {
+            "gemini": "Layer 1 · Gemini\n[dim](Auth & IDOR)[/dim]",
+            "groq": "Layer 2 · Groq\n[dim](2nd Opinion)[/dim]",
+            "judge": "Judge · Gemini\n[dim](Tie-Breaker)[/dim]",
+        }
+        trace_grid = Table.grid(padding=(0, 2))
+        trace_grid.add_column(style="bold cyan", width=18, no_wrap=True)
+        trace_grid.add_column()
+        for layer in ("gemini", "groq", "judge"):
+            q_key = f"{layer}_q"
+            if q_key in ai.reasoning_trace or layer in ai.reasoning_trace:
+                q_txt = ai.reasoning_trace.get(q_key, "")
+                a_txt = ai.reasoning_trace.get(layer, "")
+                cell = Text()
+                if q_txt:
+                    cell.append("Question: ", style="bold yellow")
+                    cell.append(q_txt + "\n")
+                if a_txt:
+                    cell.append("Answer:   ", style="bold green")
+                    cell.append(a_txt)
+                trace_grid.add_row(topic_labels[layer], cell)
+        console.print(Panel(trace_grid, title="AI Reasoning & Two-Key Dialogue", box=box.ROUNDED, border_style="magenta", expand=False))
 
     if not report.findings:
         console.print("[green]No findings reported.[/green]")
@@ -365,20 +431,6 @@ def render_summary(report: ScanReport, console: Console, sev_filter: str | None 
 
     if report.suppressed_findings:
         console.print(f"[dim]{len(report.suppressed_findings)} finding(s) suppressed or dismissed.[/dim]")
-
-    if ai.reasoning_trace:
-        topic_labels = {
-            "gemini": "Layer 1 · Gemini\n[dim](Auth & IDOR)[/dim]",
-            "groq": "Layer 2 · Groq\n[dim](2nd Opinion)[/dim]",
-            "judge": "Judge · Gemini\n[dim](Tie-Breaker)[/dim]",
-        }
-        trace_grid = Table.grid(padding=(0, 2))
-        trace_grid.add_column(style="bold cyan", width=18, no_wrap=True)
-        trace_grid.add_column()
-        for layer in ("gemini", "groq", "judge"):
-            if layer in ai.reasoning_trace and ai.reasoning_trace[layer]:
-                trace_grid.add_row(topic_labels[layer], Text(ai.reasoning_trace[layer]))
-        console.print(Panel(trace_grid, title="AI Reasoning & Topics", box=box.ROUNDED, border_style="magenta", expand=False))
 
     active_code = [(idx, f) for idx, f in code_rows if not f.suppressed and not f.dismissed]
     if active_code:

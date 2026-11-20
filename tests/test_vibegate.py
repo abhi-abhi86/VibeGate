@@ -172,13 +172,20 @@ def test_is_git_url_and_remote_scan(tmp_path):
     assert git.is_git_url("git@github.com:org/repo.git")
     assert not git.is_git_url("./demo")
 
-    # Create a local bare-like source repo and scan it via file:// URL (no network needed)
+    # Create a local source repo with main + a second branch containing a secret
     src = tmp_path / "src_repo"
     src.mkdir()
     root = _init_git_repo(src)
-    (src / "app.py").write_text('cur.execute(f"SELECT * FROM users WHERE id = {uid}")\n')
+    (src / "app.py").write_text("x = 1\n")
     subprocess.run(["git", "add", "app.py"], cwd=root, check=True)
-    subprocess.run(["git", "commit", "-m", "add app"], cwd=root, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "--no-verify", "-m", "add app"], cwd=root, check=True, capture_output=True)
+
+    subprocess.run(["git", "checkout", "-b", "feature-pr"], cwd=root, check=True, capture_output=True)
+    secret = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+    (src / "secret.py").write_text(f'TOKEN = "{secret}"\n')
+    subprocess.run(["git", "add", "secret.py"], cwd=root, check=True)
+    subprocess.run(["git", "commit", "--no-verify", "-m", "add secret on branch"], cwd=root, check=True, capture_output=True)
+    subprocess.run(["git", "checkout", "-"], cwd=root, check=True, capture_output=True)
 
     events = []
     report = scan_remote_repo(
@@ -188,6 +195,8 @@ def test_is_git_url_and_remote_scan(tmp_path):
     )
     assert report.scanned_version.startswith("git:file://")
     assert report.files_scanned == ["app.py"]
+    assert any(rs["ref"] == "branch:feature-pr" and rs["finding_count"] == 1 for rs in report.ref_summaries)
+    assert any(f.file == "secret.py" and f.scanned_version == "branch:feature-pr" for f in report.findings)
     cleanup_msgs = [msg for ev, msg in events if ev == "cleanup_done"]
     assert len(cleanup_msgs) == 1
     # Extract the temp dir path inside parentheses and confirm it was deleted

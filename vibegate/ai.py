@@ -287,14 +287,19 @@ def run_ai_review(
         return AIReviewResult("skipped", [], "no route/controller/auth-relevant code in staged changes")
 
     valid_files = {rel for rel, _ in snippets}
+    files_list = ", ".join(sorted(valid_files))
     prompt = _build_prompt(snippets)
     per_call_timeout = min(float(cfg.ai_timeout), LLM_CALL_TIMEOUT)
     use_consensus = cfg.consensus_enabled or bool(gemini_key and groq_key)
 
+    gemini_q = f"Are there any missing auth, IDOR, or permission checks in {files_list}?"
+    groq_q = f"Gemini reported Safe — double-check {files_list} for any hidden access-control or IDOR risks?"
+
     if not use_consensus:
+        emit("ai_start", f"Layer 1 (Gemini) Q: {gemini_q}")
         try:
             _is_vuln, findings, reasoning = _call_gemini(prompt, gemini_key, cfg.ai_model, valid_files, target.version, per_call_timeout)
-            trace = {"gemini": reasoning} if reasoning else {}
+            trace = {"gemini_q": gemini_q, "gemini": reasoning} if reasoning else {"gemini_q": gemini_q}
             _attach_consensus(findings, "single", trace)
             ms = int((time.monotonic() - start) * 1000)
             return AIReviewResult("ok", findings, f"reviewed {len(snippets)} file(s) with {cfg.ai_model}", ms, "single", trace)
@@ -310,7 +315,7 @@ def run_ai_review(
     # 2-Layer Gated Consensus:
     # 1) Run Layer 1 (Gemini). If Gemini finds vulnerabilities, return immediately without calling Groq.
     # 2) Only if Gemini says Safe (no vulnerabilities) OR Gemini errors/times out, run Layer 2 (Groq).
-    emit("ai_start", f"AI Layer 1 ({cfg.ai_model}): reviewing access control & auth...")
+    emit("ai_start", f"Layer 1 (Gemini) Q: {gemini_q}")
     g_verdict = None
     g_err = None
     try:
@@ -326,10 +331,11 @@ def run_ai_review(
 
     if g_verdict is None:
         # Layer 1 (Gemini) failed -> fall back to Layer 2 (Groq) instead of skipping AI reasoning
-        emit("ai_start", f"AI Layer 1 failed ({g_err}) -> falling back to Layer 2 ({cfg.groq_model})...")
+        fallback_q = f"Gemini failed ({g_err}) — review {files_list} for missing auth or IDOR risks?"
+        emit("ai_start", f"Layer 2 (Groq) Q: {fallback_q}")
         try:
             q_vuln, q_findings, q_reason = _call_groq(prompt, groq_key, cfg.groq_model, valid_files, target.version, per_call_timeout)
-            trace = {"gemini": f"fallback ({g_err})", "groq": q_reason}
+            trace = {"gemini_q": gemini_q, "gemini": f"fallback ({g_err})", "groq_q": fallback_q, "groq": q_reason}
             final_findings = q_findings if q_vuln else []
             _attach_consensus(final_findings, "single_fallback", trace)
             ms = int((time.monotonic() - start) * 1000)
@@ -341,18 +347,19 @@ def run_ai_review(
 
     g_vuln, g_findings, g_reason = g_verdict
     if g_vuln:
-        trace = {"gemini": g_reason} if g_reason else {}
+        trace = {"gemini_q": gemini_q, "gemini": g_reason} if g_reason else {"gemini_q": gemini_q}
         _attach_consensus(g_findings, "single", trace)
         ms = int((time.monotonic() - start) * 1000)
         return AIReviewResult("ok", g_findings, f"Layer 1 (Gemini) found {len(g_findings)} issue(s)", ms, "single", trace)
 
     # Layer 1 (Gemini) reported no vulnerabilities -> run Layer 2 (Groq)
-    emit("ai_start", f"AI Layer 1 Safe -> Layer 2 ({cfg.groq_model}): verifying no hidden risks...")
+    emit("ai_done", f"Layer 1 (Gemini) answered: No vulnerabilities — escalating to Layer 2 (Groq)")
+    emit("ai_start", f"Layer 2 (Groq) Q: {groq_q}")
     try:
         q_vuln, q_findings, q_reason = _call_groq(prompt, groq_key, cfg.groq_model, valid_files, target.version, per_call_timeout)
     except Exception as exc:
         # Hard fallback: Groq timeout / 429 / JSON failure never crashes the gate
-        trace = {"gemini": g_reason, "groq": f"fallback ({type(exc).__name__}: {exc})"}
+        trace = {"gemini_q": gemini_q, "gemini": g_reason, "groq_q": groq_q, "groq": f"fallback ({type(exc).__name__}: {exc})"}
         ms = int((time.monotonic() - start) * 1000)
         return AIReviewResult(
             "ok",
@@ -363,22 +370,25 @@ def run_ai_review(
             trace,
         )
 
-    trace = {"gemini": g_reason, "groq": q_reason}
+    trace = {"gemini_q": gemini_q, "gemini": g_reason, "groq_q": groq_q, "groq": q_reason}
     if not q_vuln:
         ms = int((time.monotonic() - start) * 1000)
         return AIReviewResult("ok", [], "2/2 consensus: Safe (both models verified)", ms, "2/2_safe", trace)
 
     # Disagreement (Gemini: Safe, Groq: Vulnerable) -> trigger Judge call via Gemini
-    emit("ai_start", "AI Disagreement -> Judge (Gemini): resolving verdict...")
+    judge_q = f"Gemini said Safe while Groq flagged {len(q_findings)} issue(s) — which verdict is correct for {files_list}?"
+    emit("ai_start", f"Judge (Gemini) Q: {judge_q}")
     judge_prompt = _build_judge_prompt(snippets, g_verdict, (q_vuln, q_findings, q_reason))
     try:
         j_vuln, j_findings, j_reason = _call_gemini(judge_prompt, gemini_key, cfg.ai_model, valid_files, target.version, per_call_timeout)
+        trace["judge_q"] = judge_q
         trace["judge"] = j_reason
         final_findings = j_findings if j_vuln else []
         _attach_consensus(final_findings, "debate_resolved", trace)
         ms = int((time.monotonic() - start) * 1000)
         return AIReviewResult("ok", final_findings, "consensus debate resolved by Judge", ms, "debate_resolved", trace)
     except Exception as exc:
+        trace["judge_q"] = judge_q
         trace["judge"] = f"judge fallback ({type(exc).__name__}: {exc})"
         ms = int((time.monotonic() - start) * 1000)
         return AIReviewResult("ok", [], "Judge unavailable; using Gemini Safe verdict", ms, "single_fallback", trace)

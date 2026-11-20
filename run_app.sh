@@ -58,22 +58,20 @@ if [ "$#" -gt 0 ]; then
 fi
 
 cat <<'EOF'
- __     ___ _           ____       _       
- \ \   / (_) |__   ___ / ___| __ _| |_ ___ 
+ __     ___ _           ____       _
+ \ \   / (_) |__   ___ / ___| __ _| |_ ___
   \ \ / /| | '_ \ / _ \ |  _ / _` | __/ _ \
    \ V / | | |_) |  __/ |_| | (_| | ||  __/
     \_/  |_|_.__/ \___|\____|\__,_|\__\___|
                               by team Z-ZONE
 EOF
-echo "Scan a target for vulnerabilities:"
 echo "  1) Git repository URL (clones temporarily, scans all files, then deletes the clone)"
 echo "  2) Local project folder / downloaded directory"
 echo "  3) Single local file path (e.g. an unuploaded file on your system)"
-echo "  4) Check environment & scanners (doctor)"
-echo "  5) List built-in security rules (rules)"
-echo "  6) Run 90-second live demo (demo)"
-echo "  7) Activate automatic Git commit & push protection (all repos, no path needed)"
-printf "Choose [1-7] or paste a Git URL / path directly: "
+echo "  4) Activate automatic Git commit & push protection (all repos, no path needed)"
+echo "  5) Deactivate automatic Git commit & push protection"
+echo ""
+printf "Choose [1-5] or paste a Git URL / path: "
 IFS= read -r CHOICE
 CHOICE="$(printf '%s' "$CHOICE" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
 case "$CHOICE" in
@@ -90,17 +88,10 @@ case "$CHOICE" in
     IFS= read -r TARGET
     ;;
   4)
-    exec "$VIBEGATE_BIN" doctor
+    exec "$VIBEGATE_BIN" hook install --global --which all
     ;;
   5)
-    exec "$VIBEGATE_BIN" rules
-    ;;
-  6)
-    run_live_demo
-    exit 0
-    ;;
-  7)
-    exec "$VIBEGATE_BIN" hook install --global --which all
+    exec "$VIBEGATE_BIN" hook uninstall --global
     ;;
   *)
     TARGET="$CHOICE"
@@ -108,7 +99,6 @@ case "$CHOICE" in
 esac
 
 TARGET="$(printf '%s' "$TARGET" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-
 if [ -z "$TARGET" ]; then
   echo "No target provided."
   exit 2
