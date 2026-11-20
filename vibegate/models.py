@@ -6,7 +6,7 @@ import hashlib
 from dataclasses import asdict, dataclass, field
 
 SEVERITIES = ["info", "low", "medium", "high", "critical"]
-CATEGORIES = ["secret", "injection", "access_control", "dependency", "other"]
+CATEGORIES = ["secret", "injection", "access_control", "dependency", "bug", "other"]
 CONFIDENCES = ["low", "medium", "high"]
 
 # verification_status values

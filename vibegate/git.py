@@ -103,3 +103,32 @@ def hooks_dir(root: str) -> str:
     out = _git(["rev-parse", "--git-path", "hooks"], cwd=root).strip()
     return out if os.path.isabs(out) else os.path.join(root, out)
 
+
+ZERO_SHA = "0" * 40
+
+
+def push_changed_files(root: str, local_sha: str, remote_sha: str) -> list[str]:
+    """Return files added/modified in the commit range being pushed."""
+    if not local_sha or local_sha == ZERO_SHA:
+        return []
+    if not remote_sha or remote_sha == ZERO_SHA:
+        # New branch: diff against merge-base with origin/HEAD or list all files at local_sha
+        for base_ref in ("origin/main", "origin/master", "main", "master"):
+            mb = _git(["merge-base", base_ref, local_sha], cwd=root, check=False).strip()
+            if mb and mb != local_sha:
+                return _split_z(_git(["diff", "--name-only", "--diff-filter=ACMR", "-z", mb, local_sha], cwd=root))
+        return _split_z(_git(["ls-tree", "-r", "--name-only", "-z", local_sha], cwd=root))
+    return _split_z(_git(["diff", "--name-only", "--diff-filter=ACMR", "-z", remote_sha, local_sha], cwd=root))
+
+
+def checkout_commit(root: str, commit_sha: str, files: list[str], dest: str) -> None:
+    """Write the exact committed version of files at commit_sha into dest."""
+    for rel in files:
+        proc = subprocess.run(["git", "show", f"{commit_sha}:{rel}"], cwd=root, capture_output=True)
+        if proc.returncode != 0:
+            continue
+        out_path = os.path.join(dest, rel)
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        with open(out_path, "wb") as fh:
+            fh.write(proc.stdout)
+

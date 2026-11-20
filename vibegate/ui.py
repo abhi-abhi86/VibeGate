@@ -6,6 +6,7 @@ import os
 import sys
 import threading
 
+from rich import box
 from rich.console import Console, Group
 from rich.live import Live
 from rich.panel import Panel
@@ -18,7 +19,7 @@ from rich.text import Text
 from vibegate import git
 from vibegate.config import Config
 from vibegate.engine import ScanReport, evaluate_policy
-from vibegate.models import Finding
+from vibegate.models import Finding, sev_rank
 from vibegate.patcher import (
     apply_all_safe_fixes,
     apply_patch,
@@ -107,9 +108,16 @@ def threat_impact(finding: Finding) -> str:
             "passwords or integrity checks."
         )
     if cat == "dependency":
+        aliases = ", ".join((finding.extra.get("aliases") or [])[:3])
+        ref = f"{finding.rule_id}" + (f" ({aliases})" if aliases else "")
         return (
-            "If your app reaches the affected code path, attackers can exploit this known CVE "
-            "(such as remote code execution, DoS, or data leakage)."
+            f"OSV advisory {ref} affects this package version. Actual impact depends on "
+            "whether your code reaches the vulnerable function/path."
+        )
+    if cat == "bug":
+        return (
+            "This code glitch can cause silent data corruption, unexpected runtime crashes, "
+            "or swallowed errors that make production failures hard to diagnose."
         )
     return "If reachable by untrusted input, this weakness can be abused to compromise data or availability."
 
@@ -171,33 +179,56 @@ def _open_tty_input():
         return None
 
 
+def _status_text(f: Finding) -> str:
+    if f.suppressed:
+        return "suppressed"
+    if f.dismissed:
+        return "dismissed"
+    return STATUS_LABELS.get(f.verification_status, f.verification_status)
+
+
+def _render_detail_panel(idx: int, f: Finding, report: ScanReport, console: Console) -> None:
+    sev_style = SEV_STYLE.get(f.severity, "white")
+    full_path = os.path.join(report.target_root, f.file) if os.path.isdir(report.target_root) else f.file
+    line_info = f"Line {f.start_line}" if f.start_line else "File-level"
+    if f.end_line and f.end_line != f.start_line:
+        line_info = f"Lines {f.start_line}-{f.end_line}"
+
+    grid = Table.grid(padding=(0, 2))
+    grid.add_column(style="bold", width=10, no_wrap=True)
+    grid.add_column()
+    grid.add_row("File", f"[cyan]{f.location}[/cyan] ({line_info})   [dim]Rule: {f.rule_id} · {f.source_label}[/dim]")
+    grid.add_row("Path", Text(full_path, style="dim"))
+    grid.add_row("Code", Text(_pinpoint_code(report.target_root, f)))
+    grid.add_row("Issue", Text(f.explanation))
+    grid.add_row("Threat", Text(threat_impact(f), style="red"))
+    grid.add_row("Fix", Text(f.remediation, style="green"))
+
+    console.print(
+        Panel(
+            grid,
+            title=Text(f"#{idx} [{f.severity.upper()}] {f.title}"),
+            border_style=sev_style,
+            box=box.ROUNDED,
+            expand=False,
+        )
+    )
+
+
 def render_summary(report: ScanReport, console: Console) -> None:
     console.print()
-    header = Text()
-    header.append("VibeGate ", style="bold magenta")
-    header.append(f"scanned {len(report.files_scanned)} {report.scanned_version} file(s) ", style="bold")
-    header.append(f"in {report.duration_ms / 1000:.2f}s", style="bold cyan")
-    console.print(Panel(header, expand=False, border_style="magenta"))
-
-    # Security Scorecard
     active_count = len(report.active_findings)
     crit_high = sum(1 for f in report.active_findings if f.severity in ("critical", "high"))
     if report.policy_blocked:
-        score_text = f"[bold red]Security Scorecard: {active_count} Risk(s) ({crit_high} Critical/High) — BLOCKED[/bold red]"
+        score_text = f"[bold red]{active_count} Risk(s) ({crit_high} Critical/High) — BLOCKED[/bold red]"
+        border = "red"
     elif active_count > 0:
-        score_text = f"[yellow]Security Scorecard: {active_count} Non-blocking Risk(s) — PASS[/yellow]"
+        score_text = f"[yellow]{active_count} Non-blocking Risk(s) — PASS[/yellow]"
+        border = "yellow"
     else:
-        score_text = "[bold green]Security Scorecard: 0 Risks — SAFE TO SHIP[/bold green]"
-    console.print(score_text)
+        score_text = "[bold green]0 Risks — SAFE TO SHIP[/bold green]"
+        border = "green"
 
-    if report.partially_staged_files:
-        console.print(
-            "[yellow]Notice:[/yellow] Partially staged file(s) detected: "
-            + ", ".join(report.partially_staged_files)
-            + ". VibeGate scanned the [bold]staged[/bold] version only and will not auto-rewrite or auto-stage them."
-        )
-
-    # Scanner & AI status line
     parts = []
     for sr in report.scanner_results:
         color = "green" if sr.status == "ok" else ("dim" if sr.status == "skipped" else "yellow")
@@ -205,16 +236,21 @@ def render_summary(report: ScanReport, console: Console) -> None:
     ai = report.ai_result
     ai_color = "green" if ai.status == "ok" else ("dim" if ai.status == "skipped" else "yellow")
     parts.append(f"[{ai_color}]ai-review: {ai.status}[/{ai_color}]")
-    console.print("Scanners: " + " | ".join(parts))
-    for sr in report.scanner_results:
-        if sr.status in ("error", "timeout", "not_installed") and sr.message:
-            console.print(f"[yellow]{sr.name} note:[/yellow] {sr.message.splitlines()[-1]}")
-    if ai.status not in ("ok", "skipped") and ai.message:
-        console.print(f"[yellow]AI review note:[/yellow] {ai.message}")
 
-    if not report.findings:
-        console.print("[green]No findings reported.[/green]")
-        return
+    summary_grid = Table.grid(padding=(0, 2))
+    summary_grid.add_column(style="bold", width=11, no_wrap=True)
+    summary_grid.add_column()
+    target_label = (
+        f"1 file ({os.path.basename(report.scanned_version[5:])})"
+        if report.scanned_version.startswith("file:")
+        else f"{len(report.files_scanned)} {report.scanned_version} file(s)"
+    )
+    summary_grid.add_row(
+        "Target",
+        f"{target_label} scanned in [bold cyan]{report.duration_ms / 1000:.2f}s[/bold cyan]",
+    )
+    summary_grid.add_row("Scorecard", score_text)
+    summary_grid.add_row("Scanners", " | ".join(parts))
 
     counts: dict[str, int] = {}
     for f in report.active_findings:
@@ -225,60 +261,98 @@ def render_summary(report: ScanReport, console: Console) -> None:
             for s in ("critical", "high", "medium", "low", "info")
             if counts.get(s)
         )
-        console.print(f"Active threats: {sev_bar}")
+        summary_grid.add_row("Threats", sev_bar)
 
-    table = Table(title="Findings Summary", show_lines=False, header_style="bold")
-    table.add_column("#", style="dim", no_wrap=True)
-    table.add_column("Severity", no_wrap=True)
-    table.add_column("Source", no_wrap=True)
-    table.add_column("Location", style="cyan", no_wrap=True)
-    table.add_column("Title", overflow="fold")
-    table.add_column("Status", no_wrap=True)
+    console.print(Panel(summary_grid, title="[bold magenta]VibeGate Report[/bold magenta]", box=box.ROUNDED, border_style=border, expand=False))
 
-    for idx, f in enumerate(report.findings, 1):
-        sev = Text(f.severity.upper(), style=SEV_STYLE.get(f.severity, ""))
-        status = STATUS_LABELS.get(f.verification_status, f.verification_status)
-        if f.suppressed:
-            status = "suppressed"
-        elif f.dismissed:
-            status = "dismissed"
-        row_style = "dim" if (f.suppressed or f.dismissed) else ""
-        table.add_row(str(idx), sev, f.source_label, f.location, f.title, status, style=row_style)
+    if report.partially_staged_files:
+        console.print(
+            "[yellow]Notice:[/yellow] Partially staged file(s): "
+            + ", ".join(report.partially_staged_files)
+            + " (scanned [bold]staged[/bold] version only; auto-patch disabled for these)."
+        )
+    for sr in report.scanner_results:
+        if sr.status in ("error", "timeout", "not_installed") and sr.message:
+            console.print(f"[yellow]{sr.name} note:[/yellow] {sr.message.splitlines()[-1]}")
+    if ai.status not in ("ok", "skipped") and ai.message:
+        console.print(f"[yellow]AI review note:[/yellow] {ai.message}")
 
-    console.print(table)
-    if report.suppressed_findings:
-        console.print(f"[dim]{len(report.suppressed_findings)} finding(s) suppressed or dismissed (still listed above for visibility).[/dim]")
+    if not report.findings:
+        console.print("[green]No findings reported.[/green]")
+        return
 
-    active = report.active_findings
-    if active:
-        console.print("\n[bold]Vulnerability Details (File & Code Location):[/bold]")
-        for idx, f in enumerate(report.findings, 1):
-            if f.suppressed or f.dismissed:
-                continue
-            sev_style = SEV_STYLE.get(f.severity, "white")
-            full_path = os.path.join(report.target_root, f.file) if os.path.isdir(report.target_root) else f.file
-            line_info = f"Line {f.start_line}" if f.start_line else "File-level"
-            if f.end_line and f.end_line != f.start_line:
-                line_info = f"Lines {f.start_line}-{f.end_line}"
-            snippet = _pinpoint_code(report.target_root, f)
-            body = (
-                f"[bold]File:[/bold] [cyan]{f.location}[/cyan] ({line_info})   "
-                f"[bold]Rule:[/bold] {f.rule_id}   "
-                f"[bold]Source:[/bold] {f.source_label}\n"
-                f"[bold]Path:[/bold] [dim]{full_path}[/dim]\n"
-                f"[bold]Pinpointed Code:[/bold]\n{snippet}\n\n"
-                f"[bold]Issue:[/bold] {f.explanation}\n"
-                f"[bold red]Threat / Impact:[/bold red] {threat_impact(f)}\n"
-                f"[bold]Fix:[/bold] {f.remediation}"
-            )
-            console.print(
-                Panel(
-                    body,
-                    title=f"#{idx} [{f.severity.upper()}] {f.title}",
-                    border_style=sev_style,
-                    expand=False,
+    code_rows = [(idx, f) for idx, f in enumerate(report.findings, 1) if f.category != "dependency"]
+    dep_rows = [(idx, f) for idx, f in enumerate(report.findings, 1) if f.category == "dependency"]
+
+    if code_rows:
+        table = Table(
+            title="[bold]Code Security Threats[/bold]",
+            box=box.ROUNDED,
+            style="on #002b5c",
+            border_style="bright_cyan",
+            header_style="bold white on #003f88",
+            show_lines=False,
+        )
+        table.add_column("#", style="dim", no_wrap=True)
+        table.add_column("Severity", no_wrap=True)
+        table.add_column("Source", no_wrap=True)
+        table.add_column("Location", style="cyan", no_wrap=True)
+        table.add_column("Title", overflow="fold")
+        table.add_column("Status", no_wrap=True)
+
+        for idx, f in code_rows:
+            sev = Text(f.severity.upper(), style=SEV_STYLE.get(f.severity, ""))
+            row_style = "dim" if (f.suppressed or f.dismissed) else ""
+            table.add_row(str(idx), sev, f.source_label, f.location, f.title, _status_text(f), style=row_style)
+        console.print(table)
+
+    if dep_rows:
+        # Group dependency CVEs by (file, package, version) for a clean, readable summary
+        grouped: dict[tuple[str, str, str], list[tuple[int, Finding]]] = {}
+        for idx, f in dep_rows:
+            pkg = f.extra.get("package", f.title.split(":")[0])
+            ver = f.extra.get("version", "")
+            grouped.setdefault((f.file, pkg, ver), []).append((idx, f))
+
+        dep_table = Table(
+            title=f"[bold]Dependency Advisories ({len(dep_rows)} CVEs across {len(grouped)} package(s))[/bold]",
+            box=box.ROUNDED,
+            style="on #002b5c",
+            border_style="bright_cyan",
+            header_style="bold white on #003f88",
+        )
+        dep_table.add_column("#", style="dim", no_wrap=True)
+        dep_table.add_column("Max Sev", no_wrap=True)
+        dep_table.add_column("Package", style="cyan", no_wrap=True)
+        dep_table.add_column("Location", no_wrap=True)
+        dep_table.add_column("CVEs", justify="right", no_wrap=True)
+        dep_table.add_column("Recommended Fix")
+
+        for (fpath, pkg, ver), items in grouped.items():
+            top_idx, top_f = max(items, key=lambda pair: sev_rank(pair[1].severity))
+            sev = Text(top_f.severity.upper(), style=SEV_STYLE.get(top_f.severity, ""))
+            all_fixed = [v for _, it in items for v in (it.extra.get("fixed_versions") or [])]
+            if all_fixed:
+                best_fix = max(
+                    all_fixed,
+                    key=lambda v: tuple(int(p) if p.isdigit() else 0 for p in v.split(".")),
                 )
-            )
+                fix_txt = f"Upgrade {pkg} -> >={best_fix}"
+            else:
+                fix_txt = "No fixed version listed in OSV"
+            dep_table.add_row(str(top_idx), sev, f"{pkg} {ver}".strip(), top_f.location, str(len(items)), fix_txt)
+        console.print(dep_table)
+
+    if report.suppressed_findings:
+        console.print(f"[dim]{len(report.suppressed_findings)} finding(s) suppressed or dismissed.[/dim]")
+
+    active_code = [(idx, f) for idx, f in code_rows if not f.suppressed and not f.dismissed]
+    if active_code:
+        console.print("\n[bold]Pinpointed Code Threats & Impact:[/bold]")
+        for idx, f in active_code[:10]:
+            _render_detail_panel(idx, f, report, console)
+        if len(active_code) > 10:
+            console.print(f"[dim]...and {len(active_code) - 10} more code finding(s). Enter #<number> to inspect.[/dim]")
 
 
 def _pinpoint_code(root: str, finding: Finding) -> str:

@@ -13,7 +13,7 @@ from rich.console import Console
 
 from vibegate import __version__, git
 from vibegate.config import CONFIG_FILE, DEFAULT_TOML, load_config
-from vibegate.engine import scan_remote_repo, scan_staged, scan_working_tree
+from vibegate.engine import scan_push, scan_remote_repo, scan_staged, scan_working_tree
 from vibegate.models import SEVERITIES
 from vibegate.scanners import ALL_SCANNERS
 from vibegate.scanners.semgrep import RULES_PATH
@@ -21,10 +21,14 @@ from vibegate.patcher import apply_all_safe_fixes
 from vibegate.suppress import SUPPRESS_FILE, load_suppressions
 from vibegate.ui import LiveScanDisplay, print_banner, render_summary, run_interactive
 
-HOOK_MARKER = "# vibegate-managed-pre-commit"
-HOOK_SCRIPT = f"""#!/usr/bin/env sh
+HOOK_MARKER = "# vibegate-managed-hook"
+PRE_COMMIT_SCRIPT = f"""#!/usr/bin/env sh
 {HOOK_MARKER}
 exec vibegate scan --staged "$@"
+"""
+PRE_PUSH_SCRIPT = f"""#!/usr/bin/env sh
+{HOOK_MARKER}
+exec vibegate scan --push
 """
 
 
@@ -67,6 +71,9 @@ def _run_scan(args: argparse.Namespace, progress_cb) -> "ScanReport | int":
     if args.deps and "osv-scanner" not in cfg.scanners:
         cfg.scanners.append("osv-scanner")
 
+    if args.push:
+        ref_lines = [] if sys.stdin.isatty() else sys.stdin.read().splitlines()
+        return scan_push(repo_root, cfg, ref_lines=ref_lines, progress_cb=progress_cb), cfg
     if args.all or not repo_root or os.path.realpath(cwd) != os.path.realpath(repo_root):
         return scan_working_tree(cwd, cfg, progress_cb=progress_cb), cfg
     return scan_staged(repo_root, cfg, progress_cb=progress_cb), cfg
@@ -121,41 +128,67 @@ def cmd_scan(args: argparse.Namespace) -> int:
     else:
         report = run_interactive(report, cfg, console)
         if report.policy_blocked:
-            console.print("\n[bold red]COMMIT BLOCKED:[/bold red] " + "; ".join(report.block_reasons))
+            console.print("\n[bold red]BLOCKED:[/bold red] " + "; ".join(report.block_reasons))
         else:
-            console.print("\n[bold green]GATE PASSED.[/bold green]")
+            console.print("\n[bold green]GATE PASSED — 0 blocking vulnerabilities.[/bold green]")
+            if args.push:
+                from rich.prompt import Confirm
+                from vibegate.ui import _open_tty_input
+
+                tty = _open_tty_input()
+                if tty is not None:
+                    try:
+                        if not Confirm.ask("Proceed with `git push`?", default=True, console=console, stream=tty):
+                            console.print("[yellow]Push cancelled by developer.[/yellow]")
+                            return 1
+                    finally:
+                        if tty is not sys.stdin:
+                            tty.close()
 
     return 1 if report.policy_blocked else 0
 
 
 def cmd_hook(args: argparse.Namespace) -> int:
-    root = git.find_repo_root(".")
+    target_path = getattr(args, "path", ".") or "."
+    root = git.find_repo_root(os.path.abspath(target_path))
     if not root:
-        print("Error: not inside a Git repository.", file=sys.stderr)
+        print(f"Error: {target_path} is not inside a Git repository.", file=sys.stderr)
         return 2
-    hook_path = os.path.join(git.hooks_dir(root), "pre-commit")
+    hdir = git.hooks_dir(root)
+    mode = getattr(args, "which", "all") or "all"
+    targets = []
+    if mode in ("all", "pre-commit"):
+        targets.append(("pre-commit", PRE_COMMIT_SCRIPT))
+    if mode in ("all", "pre-push"):
+        targets.append(("pre-push", PRE_PUSH_SCRIPT))
+
     if args.hook_action == "install":
-        if os.path.exists(hook_path) and not args.force:
-            with open(hook_path, encoding="utf-8", errors="replace") as fh:
-                if HOOK_MARKER not in fh.read():
-                    print(f"Error: {hook_path} already exists. Re-run with --force to overwrite.", file=sys.stderr)
-                    return 2
-        os.makedirs(os.path.dirname(hook_path), exist_ok=True)
-        with open(hook_path, "w", encoding="utf-8") as fh:
-            fh.write(HOOK_SCRIPT)
-        os.chmod(hook_path, os.stat(hook_path).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-        print(f"Installed VibeGate pre-commit hook at {hook_path}")
+        os.makedirs(hdir, exist_ok=True)
+        for name, script in targets:
+            hook_path = os.path.join(hdir, name)
+            if os.path.exists(hook_path) and not args.force:
+                with open(hook_path, encoding="utf-8", errors="replace") as fh:
+                    content = fh.read()
+                    if HOOK_MARKER not in content and "vibegate-managed" not in content:
+                        print(f"Error: {hook_path} already exists. Re-run with --force to overwrite.", file=sys.stderr)
+                        return 2
+            with open(hook_path, "w", encoding="utf-8") as fh:
+                fh.write(script)
+            os.chmod(hook_path, os.stat(hook_path).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+            print(f"Installed VibeGate {name} hook at {hook_path}")
         return 0
     if args.hook_action == "uninstall":
-        if not os.path.exists(hook_path):
-            print("No pre-commit hook found.")
-            return 0
-        with open(hook_path, encoding="utf-8", errors="replace") as fh:
-            if HOOK_MARKER not in fh.read():
-                print(f"Error: {hook_path} was not installed by VibeGate; leaving it untouched.", file=sys.stderr)
-                return 2
-        os.remove(hook_path)
-        print(f"Removed VibeGate pre-commit hook at {hook_path}")
+        for name, _ in targets:
+            hook_path = os.path.join(hdir, name)
+            if not os.path.exists(hook_path):
+                continue
+            with open(hook_path, encoding="utf-8", errors="replace") as fh:
+                content = fh.read()
+                if HOOK_MARKER not in content and "vibegate-managed" not in content:
+                    print(f"Skipping {hook_path} (not installed by VibeGate).", file=sys.stderr)
+                    continue
+            os.remove(hook_path)
+            print(f"Removed VibeGate {name} hook at {hook_path}")
         return 0
     return 2
 
@@ -269,6 +302,7 @@ def build_parser() -> argparse.ArgumentParser:
     scan.add_argument("--repo", help="Git repository URL to clone and scan")
     scan.add_argument("--branch", help="Branch or tag to clone when scanning --repo / a Git URL")
     scan.add_argument("--staged", action="store_true", help="Scan staged changes only (default inside local Git repos)")
+    scan.add_argument("--push", action="store_true", help="Scan commits/files being pushed (for Git pre-push hook)")
     scan.add_argument("--all", action="store_true", help="Scan all tracked/unignored files in the working tree")
     scan.add_argument("--ci", action="store_true", help="Non-interactive mode for CI")
     scan.add_argument("--json", action="store_true", help="Emit machine-readable JSON report")
@@ -280,9 +314,11 @@ def build_parser() -> argparse.ArgumentParser:
     scan.add_argument("--fail-on", choices=SEVERITIES, help="Override blocking severity threshold")
     scan.set_defaults(func=cmd_scan)
 
-    hook = sub.add_parser("hook", help="Manage Git pre-commit hook")
+    hook = sub.add_parser("hook", help="Manage Git pre-commit and pre-push hooks")
     hook.add_argument("hook_action", choices=["install", "uninstall"])
-    hook.add_argument("--force", action="store_true", help="Overwrite an existing non-VibeGate pre-commit hook")
+    hook.add_argument("path", nargs="?", default=".", help="Git repository path (default: .)")
+    hook.add_argument("--which", choices=["all", "pre-commit", "pre-push"], default="all", help="Which hook(s) to manage")
+    hook.add_argument("--force", action="store_true", help="Overwrite an existing non-VibeGate hook")
     hook.set_defaults(func=cmd_hook)
 
     init = sub.add_parser("init", help="Create a default .vibegate.toml config")

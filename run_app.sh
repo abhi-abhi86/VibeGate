@@ -72,7 +72,8 @@ echo "  3) Single local file path (e.g. an unuploaded file on your system)"
 echo "  4) Check environment & scanners (doctor)"
 echo "  5) List built-in security rules (rules)"
 echo "  6) Run 90-second live demo (demo)"
-printf "Choose [1-6] or paste a Git URL / path directly: "
+echo "  7) Enable automatic Git commit & push protection (install hooks in a repo)"
+printf "Choose [1-7] or paste a Git URL / path directly: "
 IFS= read -r CHOICE
 case "$CHOICE" in
   1)
@@ -96,6 +97,11 @@ case "$CHOICE" in
   6)
     run_live_demo
     exit 0
+    ;;
+  7)
+    printf "Enter local Git repository path (default: .): "
+    IFS= read -r REPO_PATH
+    exec "$VIBEGATE_BIN" hook install "${REPO_PATH:-.}" --which all
     ;;
   *)
     TARGET="$CHOICE"

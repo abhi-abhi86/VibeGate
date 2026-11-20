@@ -130,7 +130,7 @@ def _run_on_target(
     suppressions = load_suppressions(repo_root)
     apply_suppressions(findings, suppressions)
 
-    findings.sort(key=lambda f: (-sev_rank(f.severity), f.file, f.start_line))
+    findings.sort(key=lambda f: (1 if f.category == "dependency" else 0, -sev_rank(f.severity), f.file, f.start_line))
     blocked, reasons = evaluate_policy(findings, scanner_results, cfg)
 
     return ScanReport(
@@ -219,4 +219,52 @@ def scan_remote_repo(
     if progress_cb:
         progress_cb("cleanup_done", f"Deleted temporary cloned repo ({td_path})")
     return report
+
+
+def scan_push(
+    repo_root: str,
+    cfg: Config,
+    ref_lines: list[str] | None = None,
+    progress_cb: Callable[[str, str], None] | None = None,
+) -> ScanReport:
+    """Scan the exact commit(s) and file(s) about to be pushed by `git push`."""
+    start = time.monotonic()
+    pairs: list[tuple[str, str]] = []
+    for raw in ref_lines or []:
+        parts = raw.strip().split()
+        if len(parts) >= 4:
+            pairs.append((parts[1], parts[3]))  # (local_sha, remote_sha)
+
+    if not pairs:
+        local_sha = git._git(["rev-parse", "HEAD"], cwd=repo_root, check=False).strip()
+        remote_sha = git._git(["rev-parse", "@{u}"], cwd=repo_root, check=False).strip() or git.ZERO_SHA
+        if local_sha:
+            pairs.append((local_sha, remote_sha))
+
+    target_sha = ""
+    files_set: set[str] = set()
+    for local_sha, remote_sha in pairs:
+        changed = git.push_changed_files(repo_root, local_sha, remote_sha)
+        if changed:
+            target_sha = local_sha
+            files_set.update(changed)
+
+    files = sorted(files_set)
+    if not files or not target_sha:
+        return ScanReport(
+            target_root=repo_root,
+            scanned_version="push",
+            files_scanned=[],
+            partially_staged_files=[],
+            findings=[],
+            scanner_results=[],
+            ai_result=AIReviewResult("skipped", [], "no changed files in push"),
+            duration_ms=int((time.monotonic() - start) * 1000),
+            policy_fail_on=cfg.fail_on,
+        )
+
+    with tempfile.TemporaryDirectory(prefix="vibegate-push-") as td:
+        git.checkout_commit(repo_root, target_sha, files, td)
+        target = ScanTarget(root=td, files=files, version=f"push ({target_sha[:7]})")
+        return _run_on_target(target, repo_root, [], cfg, start, progress_cb=progress_cb)
 

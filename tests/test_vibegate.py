@@ -10,7 +10,7 @@ from vibegate import git
 from vibegate.ai import _redact_secret_lines, run_ai_review
 from vibegate.cli import main as cli_main
 from vibegate.config import Config
-from vibegate.engine import scan_remote_repo, scan_staged, scan_working_tree
+from vibegate.engine import scan_push, scan_remote_repo, scan_staged, scan_working_tree
 from vibegate.models import Finding
 from vibegate.patcher import apply_all_safe_fixes, apply_patch, propose_patch
 from vibegate.scanners.base import ScanTarget
@@ -279,3 +279,23 @@ def test_one_keystroke_auto_patcher_all_four_types(tmp_path):
     assert "PyYAML>=5.4" in req_file.read_text()
     assert f"GITHUB_TOKEN={secret}" in (tmp_path / ".env").read_text()
     assert "GITHUB_TOKEN=" in (tmp_path / ".env.example").read_text()
+
+
+def test_pre_push_hook_install_and_scan_push(tmp_path, monkeypatch):
+    root = _init_git_repo(tmp_path)
+    monkeypatch.chdir(root)
+    assert cli_main(["hook", "install", root, "--which", "all"]) == 0
+    assert (tmp_path / ".git" / "hooks" / "pre-commit").is_file()
+    assert (tmp_path / ".git" / "hooks" / "pre-push").is_file()
+
+    # Create an unpushed commit containing a secret
+    secret = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+    (tmp_path / "leak.py").write_text(f'TOKEN = "{secret}"\n')
+    subprocess.run(["git", "add", "leak.py"], cwd=root, check=True)
+    subprocess.run(["git", "commit", "--no-verify", "-m", "add leak"], cwd=root, check=True, capture_output=True)
+    sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, check=True, capture_output=True, text=True).stdout.strip()
+
+    report = scan_push(root, Config(scanners=["gitleaks"], ai_enabled=False), ref_lines=[f"refs/heads/main {sha} refs/heads/main {'0'*40}"])
+    assert report.policy_blocked is True
+    assert len(report.findings) == 1
+    assert report.findings[0].file == "leak.py"

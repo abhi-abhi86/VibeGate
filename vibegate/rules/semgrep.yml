@@ -326,13 +326,16 @@ rules:
     patterns:
       - pattern-either:
           - pattern: |
-              @$APP.route("...<...$ID>...", ...)
+              @$APP.route($ROUTE, ...)
               def $FN(..., $ID, ...):
                   ...
           - pattern: |
-              @$APP.route("...<...$ID>...", ...)
+              @$APP.route($ROUTE, ...)
               def $FN(..., $ID: $T, ...):
                   ...
+      - metavariable-regex:
+          metavariable: $ROUTE
+          regex: .*<.*(user_id|account_id|order_id|profile_id|id).*
       - metavariable-regex:
           metavariable: $ID
           regex: (?i).*(user_id|account_id|order_id|profile_id|id)$
@@ -367,9 +370,12 @@ rules:
       remediation: Add an authentication/authorization dependency via Depends(get_current_user) and verify ownership.
     patterns:
       - pattern: |
-          @$APP.$METHOD("...{$ID}...", ...)
+          @$APP.$METHOD($ROUTE, ...)
           def $FN(..., $ID: $T, ...):
               ...
+      - metavariable-regex:
+          metavariable: $ROUTE
+          regex: .*\{.*(user_id|account_id|order_id|profile_id).*
       - metavariable-regex:
           metavariable: $ID
           regex: (?i).*(user_id|account_id|order_id|profile_id)$
@@ -393,4 +399,88 @@ rules:
       - pattern: "allow read, write: if true;"
       - pattern: '".read": true'
       - pattern: '".write": true'
+
+  # ---------------------------------------------------------------- Code Glitches & Common Bugs
+  - id: python-bare-except
+    languages: [python]
+    severity: WARNING
+    message: Bare `except:` catches SystemExit and KeyboardInterrupt and silently hides unexpected bugs.
+    metadata:
+      title: "Bug: Bare except clause"
+      vibegate_category: bug
+      vibegate_severity: medium
+      confidence: HIGH
+      cwe: "CWE-396: Declaration of Catch for Generic Exception"
+      remediation: Catch specific exceptions (e.g., `except ValueError as exc:`) and log or handle the error explicitly.
+    pattern: |
+      try:
+          ...
+      except:
+          ...
+
+  - id: python-mutable-default-arg
+    languages: [python]
+    severity: WARNING
+    message: Mutable default argument ([] or {}) is shared across all calls to this function, causing state leaks.
+    metadata:
+      title: "Bug: Mutable default argument"
+      vibegate_category: bug
+      vibegate_severity: medium
+      confidence: HIGH
+      cwe: "CWE-665: Improper Initialization"
+      remediation: Use `None` as the default value and initialize a new list/dict inside the function body.
+    pattern-either:
+      - pattern: |
+          def $FN(..., $ARG=[], ...):
+              ...
+      - pattern: |
+          def $FN(..., $ARG={}, ...):
+              ...
+
+  - id: python-is-literal-comparison
+    languages: [python]
+    severity: WARNING
+    message: Using `is` / `is not` to compare strings or numbers checks object identity, not value equality, and can fail unpredictably.
+    metadata:
+      title: "Bug: Identity (`is`) comparison with literal"
+      vibegate_category: bug
+      vibegate_severity: medium
+      confidence: HIGH
+      remediation: Use `==` or `!=` when comparing values to strings or numbers.
+    pattern-either:
+      - pattern: $X is "..."
+      - pattern: $X is not "..."
+      - pattern: $X is $NUM
+      - pattern: $X is not $NUM
+    metavariable-regex:
+      metavariable: $NUM
+      regex: ^-?\d+$
+
+  - id: js-nan-equality
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: Comparing a value to `NaN` with `==` or `===` is always false in JavaScript.
+    metadata:
+      title: "Bug: Invalid NaN equality comparison"
+      vibegate_category: bug
+      vibegate_severity: medium
+      confidence: HIGH
+      remediation: Use `Number.isNaN(x)` instead of `x === NaN`.
+    pattern-either:
+      - pattern: $X == NaN
+      - pattern: $X === NaN
+      - pattern: $X != NaN
+      - pattern: $X !== NaN
+
+  - id: js-assignment-in-condition
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: Assignment (`=`) used inside an `if` condition instead of comparison (`===`).
+    metadata:
+      title: "Bug: Assignment inside if condition"
+      vibegate_category: bug
+      vibegate_severity: medium
+      confidence: MEDIUM
+      remediation: Replace `=` with `===` if you intended a comparison.
+    pattern: if ($X = $Y) { ... }
 

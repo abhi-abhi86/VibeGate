@@ -154,7 +154,7 @@ def _propose_requirements_bump(content: str, finding: Finding) -> tuple[str, str
     fixed = finding.extra.get("fixed_versions") or []
     if not pkg or not fixed:
         return None
-    target_ver = fixed[-1]
+    target_ver = max(fixed, key=lambda v: tuple(int(p) if p.isdigit() else 0 for p in v.split(".")))
     lines = content.splitlines(keepends=True)
     pat = re.compile(rf"^(\s*{re.escape(pkg)})\s*(?:==|>=|~=)\s*[^\s;#]+(.*)$", re.IGNORECASE)
     changed = False
