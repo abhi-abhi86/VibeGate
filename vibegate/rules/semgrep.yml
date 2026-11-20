@@ -1,0 +1,188 @@
+rules:
+  # ---------------------------------------------------------------- SQL injection (Python)
+  - id: python-sql-injection-fstring
+    languages: [python]
+    severity: ERROR
+    message: >-
+      A SQL query is built with an f-string and passed to execute(). If any interpolated value
+      comes from a user, they can change the structure of the query (SQL injection).
+    metadata:
+      title: SQL query built with an f-string
+      vibegate_category: injection
+      vibegate_severity: high
+      confidence: HIGH
+      cwe: "CWE-89: SQL Injection"
+      remediation: >-
+        Use a parameterized query: keep the SQL text constant with placeholders (? for sqlite3,
+        %s for psycopg/MySQL) and pass values as the second argument to execute().
+    pattern-either:
+      - pattern: $CUR.execute(f"...", ...)
+      - pattern: $CUR.executemany(f"...", ...)
+      - patterns:
+          - pattern: |
+              $Q = f"..."
+              ...
+              $CUR.execute($Q, ...)
+          - focus-metavariable: $Q
+
+  - id: python-sql-injection-string-build
+    languages: [python]
+    severity: ERROR
+    message: >-
+      A SQL query is built with string formatting or concatenation and passed to execute().
+      User-controlled values can alter the query (SQL injection).
+    metadata:
+      title: SQL query built by string formatting
+      vibegate_category: injection
+      vibegate_severity: high
+      confidence: MEDIUM
+      cwe: "CWE-89: SQL Injection"
+      remediation: Use a parameterized query and pass values separately to execute().
+    pattern-either:
+      - pattern: $CUR.execute("..." % $X, ...)
+      - pattern: $CUR.execute("...".format(...), ...)
+      - pattern: $CUR.execute("..." + $X, ...)
+      - pattern: $CUR.execute($X + "...", ...)
+
+  # ---------------------------------------------------------------- SQL injection (JS/TS)
+  - id: js-sql-injection-template-literal
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >-
+      A SQL query is built with a template literal containing interpolated values. User input can
+      change the query structure (SQL injection).
+    metadata:
+      title: SQL query built with a template literal
+      vibegate_category: injection
+      vibegate_severity: high
+      confidence: MEDIUM
+      cwe: "CWE-89: SQL Injection"
+      remediation: Use your driver's placeholders (e.g. db.query("... WHERE id = $1", [id])) instead of interpolation.
+    patterns:
+      - pattern: $DB.$METHOD(`...${$X}...`, ...)
+      - metavariable-regex:
+          metavariable: $METHOD
+          regex: ^(query|execute|raw|all|get|run|exec|prepare)$
+      - metavariable-regex:
+          metavariable: $DB
+          regex: (?i).*(db|sql|conn|pool|client|knex|sequelize|prisma|database|pg|mysql).*
+
+  # ---------------------------------------------------------------- Command injection
+  - id: python-subprocess-shell-true
+    languages: [python]
+    severity: ERROR
+    message: >-
+      subprocess is called with shell=True and a non-constant command. Shell metacharacters in user
+      input can run arbitrary commands (command injection).
+    metadata:
+      title: Shell command built from dynamic input
+      vibegate_category: injection
+      vibegate_severity: high
+      confidence: MEDIUM
+      cwe: "CWE-78: OS Command Injection"
+      remediation: Pass the command as a list of arguments with shell=False (the default) and validate inputs.
+    patterns:
+      - pattern-either:
+          - pattern: subprocess.$F($CMD, ..., shell=True, ...)
+      - pattern-not: subprocess.$F("...", ..., shell=True, ...)
+
+  - id: python-os-system-dynamic
+    languages: [python]
+    severity: ERROR
+    message: os.system() / os.popen() is called with a dynamically built string (command injection risk).
+    metadata:
+      title: os.system with dynamic input
+      vibegate_category: injection
+      vibegate_severity: high
+      confidence: MEDIUM
+      cwe: "CWE-78: OS Command Injection"
+      remediation: Use subprocess.run([...]) with an argument list instead of a shell string.
+    patterns:
+      - pattern-either:
+          - pattern: os.system($CMD)
+          - pattern: os.popen($CMD, ...)
+      - pattern-not: os.system("...")
+      - pattern-not: os.popen("...", ...)
+
+  - id: js-child-process-exec-dynamic
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: child_process exec() is called with a dynamically built command string (command injection risk).
+    metadata:
+      title: exec() with dynamic command
+      vibegate_category: injection
+      vibegate_severity: high
+      confidence: MEDIUM
+      cwe: "CWE-78: OS Command Injection"
+      remediation: Use execFile()/spawn() with an argument array and no shell.
+    patterns:
+      - pattern-either:
+          - pattern: exec(`...${$X}...`, ...)
+          - pattern: $CP.exec(`...${$X}...`, ...)
+          - pattern: exec("..." + $X, ...)
+          - pattern: $CP.exec("..." + $X, ...)
+
+  # ---------------------------------------------------------------- Code execution / unsafe deserialization
+  - id: python-eval-dynamic
+    languages: [python]
+    severity: ERROR
+    message: eval()/exec() on a non-constant value can execute attacker-supplied code.
+    metadata:
+      title: eval/exec of dynamic input
+      vibegate_category: injection
+      vibegate_severity: high
+      confidence: MEDIUM
+      cwe: "CWE-95: Eval Injection"
+      remediation: Avoid eval/exec; use ast.literal_eval for literals or an explicit parser.
+    patterns:
+      - pattern-either:
+          - pattern: eval($X)
+          - pattern: exec($X)
+      - pattern-not: eval("...")
+      - pattern-not: exec("...")
+
+  - id: python-yaml-unsafe-load
+    languages: [python]
+    severity: WARNING
+    message: yaml.load() without SafeLoader can construct arbitrary Python objects from untrusted input.
+    metadata:
+      title: Unsafe YAML load
+      vibegate_category: injection
+      vibegate_severity: medium
+      confidence: HIGH
+      cwe: "CWE-502: Deserialization of Untrusted Data"
+      remediation: Use yaml.safe_load() or pass Loader=yaml.SafeLoader.
+    patterns:
+      - pattern: yaml.load(...)
+      - pattern-not: yaml.load(..., Loader=yaml.SafeLoader, ...)
+      - pattern-not: yaml.load(..., Loader=SafeLoader, ...)
+
+  - id: python-pickle-loads
+    languages: [python]
+    severity: WARNING
+    message: pickle.loads()/load() on untrusted data can execute arbitrary code.
+    metadata:
+      title: Unsafe pickle deserialization
+      vibegate_category: injection
+      vibegate_severity: medium
+      confidence: LOW
+      cwe: "CWE-502: Deserialization of Untrusted Data"
+      remediation: Use a data-only format such as JSON for untrusted input.
+    pattern-either:
+      - pattern: pickle.loads(...)
+      - pattern: pickle.load(...)
+
+  # ---------------------------------------------------------------- Misconfiguration
+  - id: flask-debug-enabled
+    languages: [python]
+    severity: WARNING
+    message: Flask debug mode exposes an interactive debugger that allows code execution if reachable.
+    metadata:
+      title: Flask debug mode enabled
+      vibegate_category: other
+      vibegate_severity: medium
+      confidence: HIGH
+      cwe: "CWE-489: Active Debug Code"
+      remediation: Read debug from configuration (off by default) and never enable it in production.
+    pattern: $APP.run(..., debug=True, ...)
+

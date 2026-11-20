@@ -1,0 +1,177 @@
+"""Core scan engine: prepares staged/working-tree target, runs scanners in parallel, applies policy."""
+
+from __future__ import annotations
+
+import os
+import tempfile
+import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+
+from vibegate import git
+from vibegate.ai import AIReviewResult, run_ai_review
+from vibegate.config import Config
+from vibegate.models import Finding, sev_rank
+from vibegate.scanners import ScannerResult, ScanTarget, build_scanners
+from vibegate.suppress import Suppression, apply_suppressions, load_suppressions
+
+
+@dataclass
+class ScanReport:
+    target_root: str
+    scanned_version: str
+    files_scanned: list[str]
+    partially_staged_files: list[str]
+    findings: list[Finding]
+    scanner_results: list[ScannerResult]
+    ai_result: AIReviewResult
+    suppressions_loaded: list[Suppression] = field(default_factory=list)
+    duration_ms: int = 0
+    policy_fail_on: str = "high"
+    policy_blocked: bool = False
+    block_reasons: list[str] = field(default_factory=list)
+
+    @property
+    def active_findings(self) -> list[Finding]:
+        return [f for f in self.findings if not f.suppressed and not f.dismissed]
+
+    @property
+    def suppressed_findings(self) -> list[Finding]:
+        return [f for f in self.findings if f.suppressed or f.dismissed]
+
+    def to_dict(self) -> dict:
+        return {
+            "version": "0.1.0",
+            "scanned_version": self.scanned_version,
+            "files_scanned": self.files_scanned,
+            "partially_staged_files": self.partially_staged_files,
+            "duration_ms": self.duration_ms,
+            "policy": {
+                "fail_on": self.policy_fail_on,
+                "blocked": self.policy_blocked,
+                "reasons": self.block_reasons,
+            },
+            "scanners": [s.to_dict() for s in self.scanner_results],
+            "ai_review": self.ai_result.to_dict(),
+            "summary": {
+                "total_findings": len(self.findings),
+                "active_findings": len(self.active_findings),
+                "suppressed_or_dismissed": len(self.suppressed_findings),
+            },
+            "findings": [f.to_dict() for f in self.findings],
+        }
+
+
+def evaluate_policy(
+    findings: list[Finding],
+    scanner_results: list[ScannerResult],
+    cfg: Config,
+) -> tuple[bool, list[str]]:
+    threshold = sev_rank(cfg.fail_on)
+    reasons: list[str] = []
+    blocking = []
+    for f in findings:
+        if f.suppressed or f.dismissed:
+            continue
+        if f.ai_generated and not cfg.ai_findings_block:
+            continue
+        if sev_rank(f.severity) >= threshold:
+            blocking.append(f)
+    if blocking:
+        reasons.append(f"{len(blocking)} active finding(s) at or above severity '{cfg.fail_on}'")
+    if cfg.block_on_scanner_error:
+        bad = [s for s in scanner_results if s.status in ("error", "timeout", "not_installed")]
+        if bad:
+            reasons.append("scanner failure(s): " + ", ".join(f"{s.name}={s.status}" for s in bad))
+    return bool(reasons), reasons
+
+
+def _run_on_target(
+    target: ScanTarget,
+    repo_root: str | None,
+    partially_staged_files: list[str],
+    cfg: Config,
+    start_time: float,
+) -> ScanReport:
+    scanners = build_scanners(cfg.scanners)
+    scanner_results: list[ScannerResult] = []
+    with ThreadPoolExecutor(max_workers=max(1, len(scanners))) as pool:
+        futures = [pool.submit(s.run, target, cfg.scanner_timeout) for s in scanners.values()]
+        for fut in futures:
+            scanner_results.append(fut.result())
+
+    findings: list[Finding] = []
+    for sr in scanner_results:
+        for f in sr.findings:
+            f.scanned_version = target.version
+            findings.append(f)
+
+    secret_findings = [f for f in findings if f.category == "secret"]
+    ai_res = run_ai_review(target, secret_findings, cfg)
+    for f in ai_res.findings:
+        f.scanned_version = target.version
+        findings.append(f)
+
+    suppressions = load_suppressions(repo_root)
+    apply_suppressions(findings, suppressions)
+
+    findings.sort(key=lambda f: (-sev_rank(f.severity), f.file, f.start_line))
+    blocked, reasons = evaluate_policy(findings, scanner_results, cfg)
+
+    return ScanReport(
+        target_root=repo_root or target.root,
+        scanned_version=target.version,
+        files_scanned=list(target.files),
+        partially_staged_files=partially_staged_files,
+        findings=findings,
+        scanner_results=scanner_results,
+        ai_result=ai_res,
+        suppressions_loaded=suppressions,
+        duration_ms=int((time.monotonic() - start_time) * 1000),
+        policy_fail_on=cfg.fail_on,
+        policy_blocked=blocked,
+        block_reasons=reasons,
+    )
+
+
+def scan_staged(repo_root: str, cfg: Config) -> ScanReport:
+    start = time.monotonic()
+    files = git.staged_files(repo_root)
+    partial = git.partially_staged(repo_root, files)
+    if not files:
+        return ScanReport(
+            target_root=repo_root,
+            scanned_version="staged",
+            files_scanned=[],
+            partially_staged_files=[],
+            findings=[],
+            scanner_results=[],
+            ai_result=AIReviewResult("skipped", [], "no staged files to scan"),
+            duration_ms=int((time.monotonic() - start) * 1000),
+            policy_fail_on=cfg.fail_on,
+        )
+
+    with tempfile.TemporaryDirectory(prefix="vibegate-staged-") as td:
+        git.checkout_index(repo_root, files, td)
+        target = ScanTarget(root=td, files=files, version="staged")
+        return _run_on_target(target, repo_root, partial, cfg, start)
+
+
+def scan_working_tree(path: str, cfg: Config) -> ScanReport:
+    start = time.monotonic()
+    abs_path = os.path.abspath(path)
+    repo_root = git.find_repo_root(abs_path)
+    if repo_root:
+        files = git.listed_files(repo_root)
+        partial = git.partially_staged(repo_root)
+        target = ScanTarget(root=repo_root, files=files, version="working tree")
+        return _run_on_target(target, repo_root, partial, cfg, start)
+
+    files = []
+    for dirpath, dirnames, filenames in os.walk(abs_path):
+        dirnames[:] = [d for d in dirnames if d not in (".git", ".venv", "node_modules", "__pycache__")]
+        for fn in filenames:
+            files.append(os.path.relpath(os.path.join(dirpath, fn), abs_path))
+    target = ScanTarget(root=abs_path, files=sorted(files), version="directory")
+    return _run_on_target(target, None, [], cfg, start)
+

@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vibegate"
+version = "0.1.0"
+description = "A local-first security gate for AI-generated code: scans staged changes before commit."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+dependencies = ["rich>=13.0"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+vibegate = "vibegate.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["vibegate*"]
+
+[tool.setuptools.package-data]
+vibegate = ["rules/*.yml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
