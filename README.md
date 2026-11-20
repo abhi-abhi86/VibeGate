@@ -1,17 +1,42 @@
+```text
+ __     ___ _           ____       _
+ \ \   / (_) |__   ___ / ___| __ _| |_ ___
+  \ \ / /| | '_ \ / _ \ |  _ / _` | __/ _ \
+   \ V / | | |_) |  __/ |_| | (_| | ||  __/
+    \_/  |_|_.__/ \___|\____|\__,_|\__\___|
+                              by team Z-ZONE
+```
+
 # VibeGate
 
-A local-first security gate for AI-generated code. VibeGate scans your **staged** Git changes before a commit, combining deterministic scanners (**Gitleaks**, **Semgrep**, **OSV-Scanner**) with an optional **Gemini** authorization review for context-dependent access-control gaps (like IDORs).
+A local-first security gate for AI-generated code. VibeGate scans **remote Git repositories**, **local/downloaded folders**, **single unuploaded files**, or **staged Git changes** before a commit—combining deterministic cybersecurity scanners (**Gitleaks**, **Semgrep**) with an optional **Gemini** authorization review for context-dependent access-control gaps (like IDORs).
 
-VibeGate does not claim to prove code is secure; it helps catch high-signal issues early, explains them in plain English, lets you review diffs before applying a fix, and reruns the relevant check after a change.
+VibeGate does not claim to prove code is secure; it helps catch high-signal cybersecurity threats early, shows the exact file, line, and code snippet, explains each issue in plain English, lets you review diffs before applying a fix, and reruns the relevant check after a change.
 
-## Setup
+## Quick Start
 
-Create a virtual environment and install VibeGate:
+Run the launcher script (automatically creates `.venv` and installs VibeGate on first run):
 
 ```bash
-python3 -m venv .venv
-.venv/bin/pip install -e ".[dev]"
+./run_app.sh
 ```
+
+The interactive menu lets you choose:
+1. **Git repository URL** — clones all files temporarily, scans them, shows the report, and deletes the temporary clone automatically
+2. **Local project folder / downloaded directory**
+3. **Single local file** (for testing unuploaded files on your system)
+4. **Environment check** (`doctor`)
+5. **Built-in security rules** (`rules`)
+
+You can also pass a target directly:
+
+```bash
+./run_app.sh https://github.com/owner/repo.git
+./run_app.sh /path/to/local/project
+./run_app.sh /path/to/my_file.py
+```
+
+## Setup
 
 Install the deterministic scanners (macOS / Homebrew):
 
@@ -22,20 +47,45 @@ brew install gitleaks semgrep osv-scanner
 Check your environment:
 
 ```bash
-.venv/bin/vibegate doctor
+./run_app.sh doctor
 ```
 
-## Usage
+### Optional AI Authorization Review
+
+Copy `.env.example` to `.env` (`.env` is gitignored) and add your Gemini API key:
+
+```env
+GEMINI_API_KEY=your-key-here
+```
+
+If `GEMINI_API_KEY` is not set or the API times out/is unavailable, VibeGate still runs all deterministic scanners and explicitly reports that AI review was skipped/unavailable.
+
+## Commands
 
 ```bash
-# Scan staged changes (interactive terminal review)
+# Scan a remote Git repo (clones temporarily, scans, then deletes clone)
+vibegate scan https://github.com/owner/repo.git
+
+# Scan a local folder or single file
+vibegate scan /path/to/project --all
+vibegate scan /path/to/file.py
+
+# Scan staged Git changes (default inside a Git repo)
 vibegate scan
 
-# Scan all tracked/unignored files in CI mode with JSON output
-vibegate scan --all --ci --json
+# Include dependency/library CVE scanning (OSV-Scanner)
+vibegate scan --all --deps
 
-# Disable AI review (deterministic scanners only)
-vibegate scan --no-ai
+# CI mode + JSON output + save report to a file
+vibegate scan --all --ci --json
+vibegate scan --all --output vibegate-report.json
+
+# List all 18 built-in cybersecurity rules
+vibegate rules
+
+# Inspect or clear .vibegate-ignore.json suppressions
+vibegate suppressions list
+vibegate suppressions clear
 
 # Install / uninstall the Git pre-commit hook
 vibegate hook install
@@ -45,30 +95,35 @@ vibegate hook uninstall
 vibegate init
 ```
 
-Optional AI authorization review uses `GEMINI_API_KEY`:
+## What VibeGate Detects
 
-```bash
-export GEMINI_API_KEY="your-key"
-```
+- **Hard-coded secrets** via Gitleaks (API keys, tokens, private keys — masked in all outputs and redacted before any AI call)
+- **Code-level cybersecurity threats** via 18 bundled offline Semgrep rules:
+  - SQL injection (Python & JS/TS)
+  - OS command injection (`subprocess(..., shell=True)`, `os.system`, `exec`)
+  - Server-Side Template Injection (SSTI) & Cross-Site Scripting (XSS)
+  - Server-Side Request Forgery (SSRF) & Path Traversal
+  - Unsafe deserialization (`yaml.load`, `pickle.loads`) & `eval`/`exec`
+  - Disabled TLS verification (`verify=False`, `rejectUnauthorized: false`), weak hashes (`md5`/`sha1`), hardcoded Flask `secret_key`, and Flask `debug=True`
+- **Access-control / IDOR candidates** via optional Gemini AI review
+- **Dependency CVEs** via OSV-Scanner when `--deps` is enabled
 
-If `GEMINI_API_KEY` is not set or the API times out/is unavailable, VibeGate still runs all deterministic scanners and explicitly reports that AI review was skipped/unavailable.
-
-## Safe staged-change & patch workflow
+## Safe Staged-Change & Patch Workflow
 
 - **Staged-only scanning:** `vibegate scan` checks out the Git **index** (`git checkout-index`) into a temporary directory so scanners inspect what will actually be committed—not unstaged edits in your working tree.
 - **Partial staging protection:** If a file is partially staged (`git add -p`), VibeGate flags it and refuses to auto-patch or auto-stage it.
-- **Explicit patches & honest verification:** Supported deterministic findings (e.g., Python f-string SQL injection) show a unified diff and require confirmation before editing or staging. Afterward, VibeGate reruns the original scanner and reports precisely whether that rule still triggers (e.g., `no_longer_reproduces`), rather than claiming the file is "Verified Safe."
+- **Explicit patches & honest verification:** Supported deterministic findings (such as Python f-string SQL injection) show a unified diff and require confirmation before editing or staging. Afterward, VibeGate reruns the original scanner and reports precisely whether that rule still triggers (`fixed (rescan ok)` vs `still triggers`), rather than claiming the file is "Verified Safe."
 
 ## Demo
 
-`demo/` contains a small Flask app with four intentional issues:
+`demo/` contains a small Flask app with intentional issues for testing:
 1. A committed test token in `demo/app.py` (Gitleaks)
 2. A Python f-string SQL injection in `demo/app.py` (Semgrep — with reviewable patch + rescan)
 3. A missing ownership check on `DELETE /orders/<order_id>` in `demo/app.py` (AI authorization review)
-4. Vulnerable packages in `demo/requirements.txt` (OSV-Scanner)
+4. Vulnerable packages in `demo/requirements.txt` (OSV-Scanner with `--deps`)
 
-Run a non-interactive scan on `demo/`:
+Run a quick demo scan:
 
 ```bash
-.venv/bin/vibegate scan demo --all --no-tui --no-ai
+./run_app.sh demo/app.py --no-tui --no-ai
 ```
