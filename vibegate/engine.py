@@ -105,7 +105,7 @@ def _run_on_target(
     emit("scanners_start", f"Running {', '.join(scanners)} + ai-review concurrently on {len(target.files)} file(s)...")
     with ThreadPoolExecutor(max_workers=max(2, len(scanners) + 1)) as pool:
         scanner_futs = {pool.submit(s.run, target, cfg.scanner_timeout): name for name, s in scanners.items()}
-        ai_fut = pool.submit(run_ai_review, target, [], cfg)
+        ai_fut = pool.submit(run_ai_review, target, [], cfg, progress_cb=progress_cb)
         all_futs = list(scanner_futs.keys()) + [ai_fut]
         for fut in as_completed(all_futs):
             if fut is ai_fut:

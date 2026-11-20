@@ -27,7 +27,7 @@ timeout_seconds = 90
 [ai]
 # Optional AI authorization review. Needs GEMINI_API_KEY; disable with --no-ai or VIBEGATE_NO_AI=1.
 enabled = true
-model = "gemini-2.5-flash"
+model = "gemini-flash-latest"
 timeout_seconds = 20
 max_files = 4
 max_chars = 16000
@@ -46,7 +46,9 @@ class Config:
     scanners: list[str] = field(default_factory=lambda: ["gitleaks", "semgrep", "osv-scanner"])
     scanner_timeout: int = 90
     ai_enabled: bool = True
-    ai_model: str = "gemini-2.5-flash"
+    ai_model: str = "gemini-flash-latest"
+    groq_model: str = "openai/gpt-oss-120b"
+    consensus_enabled: bool = False
     ai_timeout: int = 20
     ai_max_files: int = 4
     ai_max_chars: int = 16000
@@ -96,6 +98,7 @@ def load_config(root: str | None) -> Config:
             cfg.scanner_timeout = int(sc.get("timeout_seconds", cfg.scanner_timeout))
             cfg.ai_enabled = bool(ai.get("enabled", cfg.ai_enabled))
             cfg.ai_model = ai.get("model", cfg.ai_model)
+            cfg.groq_model = ai.get("groq_model", cfg.groq_model)
             cfg.ai_timeout = int(ai.get("timeout_seconds", cfg.ai_timeout))
             cfg.ai_max_files = int(ai.get("max_files", cfg.ai_max_files))
             cfg.ai_max_chars = int(ai.get("max_chars", cfg.ai_max_chars))
@@ -106,5 +109,10 @@ def load_config(root: str | None) -> Config:
         cfg.ai_enabled = False
     if os.environ.get("VIBEGATE_AI_MODEL"):
         cfg.ai_model = os.environ["VIBEGATE_AI_MODEL"]
+    if os.environ.get("GROQ_MODEL"):
+        cfg.groq_model = os.environ["GROQ_MODEL"]
+    has_gemini = bool(os.environ.get("GEMINI_API_KEY", "").strip())
+    has_groq = bool(os.environ.get("GROQ_API_KEY", "").strip())
+    cfg.consensus_enabled = has_gemini and has_groq
     return cfg
 

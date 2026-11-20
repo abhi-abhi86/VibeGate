@@ -120,13 +120,13 @@ def cmd_scan(args: argparse.Namespace) -> int:
             fh.write("\n")
         console.print(f"[dim]Saved JSON report to {args.output}[/dim]")
     if args.ci or args.no_tui:
-        render_summary(report, console)
+        render_summary(report, console, show_reasoning=args.show_reasoning)
         if report.policy_blocked:
             console.print("\n[bold red]BLOCKED:[/bold red] " + "; ".join(report.block_reasons))
         else:
             console.print("\n[bold green]PASS:[/bold green] no policy-blocking findings.")
     else:
-        report = run_interactive(report, cfg, console)
+        report = run_interactive(report, cfg, console, show_reasoning=args.show_reasoning)
         if report.policy_blocked:
             console.print("\n[bold red]BLOCKED:[/bold red] " + "; ".join(report.block_reasons))
         else:
@@ -257,6 +257,7 @@ def cmd_init(args: argparse.Namespace) -> int:
 
 
 def cmd_doctor(_args: argparse.Namespace) -> int:
+    load_config(git.find_repo_root(".") or os.getcwd())
     console = Console()
     console.print(f"[bold]VibeGate {__version__} environment check[/bold]")
     git_path = shutil.which("git")
@@ -267,8 +268,11 @@ def cmd_doctor(_args: argparse.Namespace) -> int:
             console.print(f"  {name}: [green]{sc.version() or 'installed'}[/green]")
         else:
             console.print(f"  {name}: [yellow]not installed[/yellow] ({sc.install_hint})")
-    has_key = bool(os.environ.get("GEMINI_API_KEY", "").strip())
-    console.print(f"  GEMINI_API_KEY: {'[green]set[/green]' if has_key else '[yellow]not set (AI review will be skipped)[/yellow]'}")
+    has_gemini = bool(os.environ.get("GEMINI_API_KEY", "").strip())
+    has_groq = bool(os.environ.get("GROQ_API_KEY", "").strip())
+    console.print(f"  GEMINI_API_KEY: {'[green]set[/green]' if has_gemini else '[yellow]not set (AI review will be skipped)[/yellow]'}")
+    console.print(f"  GROQ_API_KEY: {'[green]set[/green]' if has_groq else '[dim]not set (single-model Gemini mode)[/dim]'}")
+    console.print(f"  2-Layer Consensus: {'[green]enabled (Gemini + Groq)[/green]' if (has_gemini and has_groq) else '[dim]disabled[/dim]'}")
     return 0
 
 
@@ -356,6 +360,7 @@ def build_parser() -> argparse.ArgumentParser:
     scan.add_argument("--json", action="store_true", help="Emit machine-readable JSON report")
     scan.add_argument("--no-tui", action="store_true", help="Print summary without interactive prompt")
     scan.add_argument("--no-ai", action="store_true", help="Disable AI-assisted authorization review")
+    scan.add_argument("--show-reasoning", action="store_true", help="Print full AI consensus reasoning trace")
     scan.add_argument("--deps", action="store_true", help="Also scan dependency manifests/lockfiles with OSV-Scanner")
     scan.add_argument("--auto-fix", action="store_true", help="Apply all available safe fixes and re-stage")
     scan.add_argument("--output", "-o", help="Save JSON scan report to a file")

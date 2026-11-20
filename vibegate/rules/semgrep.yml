@@ -386,6 +386,9 @@ rules:
 
   - id: nosql-wildcard-public-rule
     languages: [generic]
+    paths:
+      exclude:
+        - "**/rules/semgrep.yml"
     severity: ERROR
     message: Public wildcard read/write rule exposes the entire database to any unauthenticated user.
     metadata:
@@ -447,14 +450,19 @@ rules:
       vibegate_severity: medium
       confidence: HIGH
       remediation: Use `==` or `!=` when comparing values to strings or numbers.
-    pattern-either:
-      - pattern: $X is "..."
-      - pattern: $X is not "..."
-      - pattern: $X is $NUM
-      - pattern: $X is not $NUM
-    metavariable-regex:
-      metavariable: $NUM
-      regex: ^-?\d+$
+    patterns:
+      - pattern-either:
+          - pattern: $X is "..."
+          - pattern: $X is not "..."
+          - pattern: $X is $NUM
+          - pattern: $X is not $NUM
+      - pattern-not: $X is True
+      - pattern-not: $X is False
+      - pattern-not: $X is not True
+      - pattern-not: $X is not False
+      - metavariable-regex:
+          metavariable: $NUM
+          regex: ^-?\d+$
 
   - id: js-nan-equality
     languages: [javascript, typescript]

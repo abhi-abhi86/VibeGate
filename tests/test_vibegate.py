@@ -223,13 +223,14 @@ def test_cli_rules_and_doctor(capsys):
 
 
 def test_parallel_execution_and_offline_ai_fallback(tmp_path, monkeypatch):
-    import urllib.error
+    import httpx
 
-    def fake_urlopen(*_args, **_kwargs):
-        raise urllib.error.URLError("offline")
+    def fake_post(*_args, **_kwargs):
+        raise httpx.ConnectError("offline")
 
     monkeypatch.setenv("GEMINI_API_KEY", "dummy-key")
-    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    monkeypatch.setattr("httpx.post", fake_post)
 
     (tmp_path / "app.py").write_text('@app.route("/api/user/<int:user_id>")\ndef get_u(user_id): return {}\n')
     report = scan_working_tree(str(tmp_path), Config(scanners=["gitleaks"], ai_enabled=True))
@@ -314,3 +315,137 @@ def test_ignore_update_suggestion_unblocks_policy():
     dep.dismiss_note = "update suggestion ignored by developer"
     blocked_after, _ = evaluate_policy([dep], [], cfg)
     assert blocked_after is False
+
+
+class _MockHTTPResponse:
+    def __init__(self, payload: dict, status_code: int = 200):
+        self._payload = payload
+        self.status_code = status_code
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            import httpx
+            req = httpx.Request("POST", "https://api.groq.com/openai/v1/chat/completions")
+            resp = httpx.Response(self.status_code, request=req)
+            raise httpx.HTTPStatusError(f"HTTP {self.status_code}", request=req, response=resp)
+
+    def json(self) -> dict:
+        return self._payload
+
+
+def _gemini_payload(verdict: dict) -> dict:
+    return {"candidates": [{"content": {"parts": [{"text": json.dumps(verdict)}]}}]}
+
+
+def _groq_payload(verdict: dict) -> dict:
+    return {"choices": [{"message": {"content": json.dumps(verdict)}}]}
+
+
+def test_consensus_unanimous_safe(tmp_path, monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "g-key")
+    monkeypatch.setenv("GROQ_API_KEY", "q-key")
+    (tmp_path / "app.py").write_text('@app.route("/api/user/<int:user_id>")\ndef u(user_id): pass\n')
+    target = ScanTarget(root=str(tmp_path), files=["app.py"], version="staged")
+
+    def fake_post(url, **_kwargs):
+        if "generativelanguage.googleapis.com" in url:
+            return _MockHTTPResponse(_gemini_payload({"is_vulnerable": False, "findings": [], "reasoning": "Gemini: ownership verified."}))
+        return _MockHTTPResponse(_groq_payload({"is_vulnerable": False, "findings": [], "reasoning": "Groq: auth check present."}))
+
+    monkeypatch.setattr("httpx.post", fake_post)
+    res = run_ai_review(target, [], Config(ai_enabled=True, consensus_enabled=True))
+    assert res.status == "ok"
+    assert res.consensus_status == "2/2_safe"
+    assert res.findings == []
+    assert "Gemini:" in res.reasoning_trace["gemini"]
+    assert "Groq:" in res.reasoning_trace["groq"]
+
+
+def test_consensus_layer1_vulnerable_skips_layer2(tmp_path, monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "g-key")
+    monkeypatch.setenv("GROQ_API_KEY", "q-key")
+    (tmp_path / "app.py").write_text('@app.route("/api/user/<int:user_id>")\ndef u(user_id): pass\n')
+    target = ScanTarget(root=str(tmp_path), files=["app.py"], version="staged")
+
+    g_finding = {"file": "app.py", "start_line": 2, "end_line": 2, "severity": "high", "confidence": "high", "title": "IDOR", "evidence": "def u", "explanation": "Missing check", "remediation": "Check session"}
+    groq_called = False
+
+    def fake_post(url, **_kwargs):
+        nonlocal groq_called
+        if "generativelanguage.googleapis.com" in url:
+            return _MockHTTPResponse(_gemini_payload({"is_vulnerable": True, "findings": [g_finding], "reasoning": "Gemini found IDOR."}))
+        groq_called = True
+        return _MockHTTPResponse(_groq_payload({"is_vulnerable": False, "findings": [], "reasoning": "Should not be called."}))
+
+    monkeypatch.setattr("httpx.post", fake_post)
+    res = run_ai_review(target, [], Config(ai_enabled=True, consensus_enabled=True))
+    assert groq_called is False
+    assert res.status == "ok"
+    assert res.consensus_status == "single"
+    assert len(res.findings) == 1
+    assert "Gemini found IDOR." in res.reasoning_trace["gemini"]
+
+
+def test_consensus_disagreement_triggers_judge(tmp_path, monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "g-key")
+    monkeypatch.setenv("GROQ_API_KEY", "q-key")
+    (tmp_path / "app.py").write_text('@app.route("/api/user/<int:user_id>")\ndef u(user_id): pass\n')
+    target = ScanTarget(root=str(tmp_path), files=["app.py"], version="staged")
+
+    calls = {"gemini": 0}
+    j_finding = {"file": "app.py", "start_line": 2, "end_line": 2, "severity": "high", "confidence": "high", "title": "Confirmed IDOR", "evidence": "def u", "explanation": "No ownership check", "remediation": "Verify user_id"}
+
+    def fake_post(url, **_kwargs):
+        if "generativelanguage.googleapis.com" in url:
+            calls["gemini"] += 1
+            if calls["gemini"] == 1:
+                return _MockHTTPResponse(_gemini_payload({"is_vulnerable": False, "findings": [], "reasoning": "Gemini thought safe."}))
+            return _MockHTTPResponse(_gemini_payload({"is_vulnerable": True, "findings": [j_finding], "reasoning": "Judge confirmed IDOR."}))
+        return _MockHTTPResponse(_groq_payload({"is_vulnerable": True, "findings": [j_finding], "reasoning": "Groq flagged IDOR."}))
+
+    monkeypatch.setattr("httpx.post", fake_post)
+    res = run_ai_review(target, [], Config(ai_enabled=True, consensus_enabled=True))
+    assert calls["gemini"] == 2
+    assert res.status == "ok"
+    assert res.consensus_status == "debate_resolved"
+    assert len(res.findings) == 1
+    assert res.reasoning_trace["judge"] == "Judge confirmed IDOR."
+
+
+def test_consensus_groq_429_falls_back_to_gemini(tmp_path, monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "g-key")
+    monkeypatch.setenv("GROQ_API_KEY", "q-key")
+    (tmp_path / "app.py").write_text('@app.route("/api/user/<int:user_id>")\ndef u(user_id): pass\n')
+    target = ScanTarget(root=str(tmp_path), files=["app.py"], version="staged")
+
+    def fake_post(url, **_kwargs):
+        if "generativelanguage.googleapis.com" in url:
+            return _MockHTTPResponse(_gemini_payload({"is_vulnerable": False, "findings": [], "reasoning": "Gemini found no issues."}))
+        return _MockHTTPResponse({}, status_code=429)
+
+    monkeypatch.setattr("httpx.post", fake_post)
+    res = run_ai_review(target, [], Config(ai_enabled=True, consensus_enabled=True))
+    assert res.status == "ok"
+    assert res.consensus_status == "single_fallback"
+    assert res.findings == []
+    assert "Gemini found no issues." in res.reasoning_trace["gemini"]
+    assert "fallback" in res.reasoning_trace["groq"]
+
+
+def test_consensus_gemini_404_falls_back_to_groq(tmp_path, monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "g-key")
+    monkeypatch.setenv("GROQ_API_KEY", "q-key")
+    (tmp_path / "app.py").write_text('@app.route("/api/user/<int:user_id>")\ndef u(user_id): pass\n')
+    target = ScanTarget(root=str(tmp_path), files=["app.py"], version="staged")
+
+    def fake_post(url, **_kwargs):
+        if "generativelanguage.googleapis.com" in url:
+            return _MockHTTPResponse({}, status_code=404)
+        return _MockHTTPResponse(_groq_payload({"is_vulnerable": False, "findings": [], "reasoning": "Groq verified no IDOR."}))
+
+    monkeypatch.setattr("httpx.post", fake_post)
+    res = run_ai_review(target, [], Config(ai_enabled=True, consensus_enabled=True))
+    assert res.status == "ok"
+    assert res.consensus_status == "single_fallback"
+    assert "Groq verified no IDOR." in res.reasoning_trace["groq"]
+    assert "fallback" in res.reasoning_trace["gemini"]

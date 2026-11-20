@@ -215,7 +215,16 @@ def _render_detail_panel(idx: int, f: Finding, report: ScanReport, console: Cons
     )
 
 
-def render_summary(report: ScanReport, console: Console, sev_filter: str | None = None) -> None:
+CONSENSUS_BADGES = {
+    "2/2_safe": "[bold green][AI Consensus: 2/2 Safe][/bold green]",
+    "2/2_vulnerable": "[bold red][AI Consensus: 2/2 Vulnerable][/bold red]",
+    "debate_resolved": "[bold yellow][AI Consensus: Debate Resolved][/bold yellow]",
+    "single_fallback": "[yellow][AI: Single Fallback][/yellow]",
+    "single": "[dim][AI: Single Model][/dim]",
+}
+
+
+def render_summary(report: ScanReport, console: Console, sev_filter: str | None = None, show_reasoning: bool = False) -> None:
     console.print()
     active_count = len(report.active_findings)
     crit_high = sum(1 for f in report.active_findings if f.severity in ("critical", "high"))
@@ -251,6 +260,9 @@ def render_summary(report: ScanReport, console: Console, sev_filter: str | None 
     )
     summary_grid.add_row("Scorecard", score_text)
     summary_grid.add_row("Scanners", " | ".join(parts))
+    if ai.status == "ok":
+        badge = CONSENSUS_BADGES.get(ai.consensus_status, f"[dim][AI: {ai.consensus_status}][/dim]")
+        summary_grid.add_row("AI Consensus", badge)
 
     counts: dict[str, int] = {}
     for f in report.active_findings:
@@ -354,6 +366,20 @@ def render_summary(report: ScanReport, console: Console, sev_filter: str | None 
     if report.suppressed_findings:
         console.print(f"[dim]{len(report.suppressed_findings)} finding(s) suppressed or dismissed.[/dim]")
 
+    if ai.reasoning_trace:
+        topic_labels = {
+            "gemini": "Layer 1 · Gemini\n[dim](Auth & IDOR)[/dim]",
+            "groq": "Layer 2 · Groq\n[dim](2nd Opinion)[/dim]",
+            "judge": "Judge · Gemini\n[dim](Tie-Breaker)[/dim]",
+        }
+        trace_grid = Table.grid(padding=(0, 2))
+        trace_grid.add_column(style="bold cyan", width=18, no_wrap=True)
+        trace_grid.add_column()
+        for layer in ("gemini", "groq", "judge"):
+            if layer in ai.reasoning_trace and ai.reasoning_trace[layer]:
+                trace_grid.add_row(topic_labels[layer], Text(ai.reasoning_trace[layer]))
+        console.print(Panel(trace_grid, title="AI Reasoning & Topics", box=box.ROUNDED, border_style="magenta", expand=False))
+
     active_code = [(idx, f) for idx, f in code_rows if not f.suppressed and not f.dismissed]
     if active_code:
         console.print("\n[bold]Pinpointed Code Threats & Impact:[/bold]")
@@ -456,9 +482,9 @@ def _render_command_bar(console: Console, sev_filter: str) -> None:
     console.print(Panel(bar, title="TUI Actions", box=box.ROUNDED, border_style="cyan", expand=False))
 
 
-def run_interactive(report: ScanReport, cfg: Config, console: Console) -> ScanReport:
+def run_interactive(report: ScanReport, cfg: Config, console: Console, show_reasoning: bool = False) -> ScanReport:
     sev_filter = "all"
-    render_summary(report, console, sev_filter=sev_filter)
+    render_summary(report, console, sev_filter=sev_filter, show_reasoning=show_reasoning)
     if not report.findings:
         return report
 
