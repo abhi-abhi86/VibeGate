@@ -12,13 +12,53 @@ if [ ! -x "$VIBEGATE_BIN" ]; then
 fi
 
 if [ "$#" -gt 0 ]; then
-  exec "$VIBEGATE_BIN" "$@"
+  case "$1" in
+    scan|hook|init|doctor|-h|--help|--version)
+      exec "$VIBEGATE_BIN" "$@"
+      ;;
+    *)
+      TARGET="$1"
+      shift
+      exec "$VIBEGATE_BIN" scan "$TARGET" --all "$@"
+      ;;
+  esac
 fi
 
-# Default: scan staged changes if any exist, otherwise scan the working tree.
-if git -C "$ROOT_DIR" diff --cached --quiet --exit-code 2>/dev/null; then
-  exec "$VIBEGATE_BIN" scan --all
-else
-  exec "$VIBEGATE_BIN" scan
+cat <<'EOF'
+ __     ___ _           ____       _       
+ \ \   / (_) |__   ___ / ___| __ _| |_ ___ 
+  \ \ / /| | '_ \ / _ \ |  _ / _` | __/ _ \
+   \ V / | | |_) |  __/ |_| | (_| | ||  __/
+    \_/  |_|_.__/ \___|\____|\__,_|\__\___|
+                              by team Z-ZONE
+EOF
+echo "Scan a target for vulnerabilities:"
+echo "  1) Git repository URL (clones temporarily, scans all files, then deletes the clone)"
+echo "  2) Local project folder / downloaded directory"
+echo "  3) Single local file path (e.g. an unuploaded file on your system)"
+printf "Choose [1/2/3] or paste a Git URL / path directly: "
+IFS= read -r CHOICE
+case "$CHOICE" in
+  1)
+    printf "Enter Git repository URL: "
+    IFS= read -r TARGET
+    ;;
+  2)
+    printf "Enter local folder path: "
+    IFS= read -r TARGET
+    ;;
+  3)
+    printf "Enter local file path: "
+    IFS= read -r TARGET
+    ;;
+  *)
+    TARGET="$CHOICE"
+    ;;
+esac
+
+if [ -z "$TARGET" ]; then
+  echo "No target provided."
+  exit 2
 fi
 
+exec "$VIBEGATE_BIN" scan "$TARGET" --all

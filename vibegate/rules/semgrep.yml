@@ -186,3 +186,126 @@ rules:
       remediation: Read debug from configuration (off by default) and never enable it in production.
     pattern: $APP.run(..., debug=True, ...)
 
+  # ---------------------------------------------------------------- XSS / SSTI
+  - id: python-flask-ssti
+    languages: [python]
+    severity: ERROR
+    message: render_template_string() with a dynamically built template can allow Server-Side Template Injection (SSTI) and remote code execution.
+    metadata:
+      title: Server-Side Template Injection (SSTI)
+      vibegate_category: injection
+      vibegate_severity: critical
+      confidence: HIGH
+      cwe: "CWE-1336: Improper Neutralization of Special Elements Used in a Template Engine"
+      remediation: Use render_template() with a static template file and pass user data as template variables.
+    pattern-either:
+      - pattern: render_template_string(f"...", ...)
+      - pattern: render_template_string("..." + $X, ...)
+      - pattern: render_template_string("...".format(...), ...)
+
+  - id: js-xss-innerhtml
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: Assigning untrusted data to innerHTML or dangerouslySetInnerHTML can execute arbitrary JavaScript (XSS).
+    metadata:
+      title: Potential Cross-Site Scripting (XSS) via DOM sink
+      vibegate_category: injection
+      vibegate_severity: high
+      confidence: MEDIUM
+      cwe: "CWE-79: Cross-site Scripting"
+      remediation: Use textContent / innerText, or sanitize HTML with DOMPurify before inserting into the DOM.
+    pattern-either:
+      - pattern: $EL.innerHTML = $VAL
+      - pattern: document.write($VAL)
+
+  # ---------------------------------------------------------------- SSRF / Path Traversal
+  - id: python-ssrf-requests
+    languages: [python]
+    severity: ERROR
+    message: Outbound HTTP request URL comes directly from request input, which may allow Server-Side Request Forgery (SSRF).
+    metadata:
+      title: Potential Server-Side Request Forgery (SSRF)
+      vibegate_category: injection
+      vibegate_severity: high
+      confidence: MEDIUM
+      cwe: "CWE-918: Server-Side Request Forgery"
+      remediation: Validate the URL against an allowlist of trusted hosts/schemes before making the request.
+    pattern-either:
+      - pattern: requests.$M(request.$ATTR.get(...), ...)
+      - pattern: requests.$M(request.$ATTR[...], ...)
+      - pattern: urllib.request.urlopen(request.$ATTR.get(...), ...)
+
+  - id: python-path-traversal
+    languages: [python]
+    severity: ERROR
+    message: File path constructed from request input without sanitization can allow reading or overwriting arbitrary files (Path Traversal).
+    metadata:
+      title: Potential Path Traversal
+      vibegate_category: injection
+      vibegate_severity: high
+      confidence: MEDIUM
+      cwe: "CWE-22: Path Traversal"
+      remediation: Use werkzeug.utils.secure_filename() and verify the resolved realpath stays inside the intended base directory.
+    pattern-either:
+      - pattern: open(request.$ATTR.get(...), ...)
+      - pattern: open(request.$ATTR[...], ...)
+      - pattern: send_file(request.$ATTR.get(...), ...)
+      - pattern: send_file(request.$ATTR[...], ...)
+
+  # ---------------------------------------------------------------- Weak Crypto & TLS Bypass
+  - id: python-tls-verify-disabled
+    languages: [python]
+    severity: ERROR
+    message: TLS certificate verification is disabled (verify=False), exposing traffic to man-in-the-middle attacks.
+    metadata:
+      title: TLS certificate verification disabled
+      vibegate_category: other
+      vibegate_severity: high
+      confidence: HIGH
+      cwe: "CWE-295: Improper Certificate Validation"
+      remediation: Remove verify=False and use proper CA certificates.
+    pattern: requests.$M(..., verify=False, ...)
+
+  - id: js-tls-reject-unauthorized-false
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: "TLS certificate validation is disabled (rejectUnauthorized: false), allowing man-in-the-middle attacks."
+    metadata:
+      title: TLS certificate validation disabled
+      vibegate_category: other
+      vibegate_severity: high
+      confidence: HIGH
+      cwe: "CWE-295: Improper Certificate Validation"
+      remediation: "Remove rejectUnauthorized: false and configure trusted CA certificates."
+    pattern: "{..., rejectUnauthorized: false, ...}"
+
+  - id: python-weak-hash
+    languages: [python]
+    severity: WARNING
+    message: MD5 and SHA-1 are cryptographically broken and unsuitable for passwords, signatures, or integrity checks.
+    metadata:
+      title: Weak hash algorithm (MD5/SHA-1)
+      vibegate_category: other
+      vibegate_severity: medium
+      confidence: MEDIUM
+      cwe: "CWE-328: Use of Weak Hash"
+      remediation: Use SHA-256/SHA-512 for integrity checks, or Argon2/bcrypt/scrypt for password hashing.
+    pattern-either:
+      - pattern: hashlib.md5(...)
+      - pattern: hashlib.sha1(...)
+
+  - id: python-hardcoded-flask-secret
+    languages: [python]
+    severity: WARNING
+    message: Hardcoded Flask secret_key allows attackers to forge session cookies.
+    metadata:
+      title: Hardcoded Flask session secret
+      vibegate_category: secret
+      vibegate_severity: high
+      confidence: HIGH
+      cwe: "CWE-798: Use of Hard-coded Credentials"
+      remediation: Load secret_key from an environment variable or secret manager (without a hardcoded production fallback).
+    pattern-either:
+      - pattern: $APP.secret_key = "..."
+      - pattern: $APP.config["SECRET_KEY"] = "..."
+

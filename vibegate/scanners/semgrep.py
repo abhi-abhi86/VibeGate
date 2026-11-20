@@ -17,6 +17,7 @@ SEV_MAP = {"ERROR": "high", "WARNING": "medium", "INFO": "low"}
 def _semgrep_env(tmp_dir: str) -> dict[str, str]:
     return {
         **os.environ,
+        "HOME": tmp_dir,
         "SEMGREP_SEND_METRICS": "off",
         "SEMGREP_ENABLE_VERSION_CHECK": "0",
         "SEMGREP_USER_LOG_FILE": os.path.join(tmp_dir, "semgrep.log"),

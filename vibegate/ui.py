@@ -33,6 +33,18 @@ SEV_STYLE = {
     "info": "dim",
 }
 
+BANNER = r"""[bold magenta]
+ __     ___ _           ____       _       
+ \ \   / (_) |__   ___ / ___| __ _| |_ ___ 
+  \ \ / /| | '_ \ / _ \ |  _ / _` | __/ _ \
+   \ V / | | |_) |  __/ |_| | (_| | ||  __/
+    \_/  |_|_.__/ \___|\____|\__,_|\__\___|[/bold magenta]
+[dim]                              by team Z-ZONE[/dim]"""
+
+
+def print_banner(console: Console) -> None:
+    console.print(BANNER)
+
 
 def _open_tty_input():
     """Inside a git pre-commit hook stdin is often /dev/null; try /dev/tty if available."""
@@ -79,13 +91,13 @@ def render_summary(report: ScanReport, console: Console) -> None:
         console.print("[green]No findings reported.[/green]")
         return
 
-    table = Table(title="Findings", show_lines=False, header_style="bold", expand=True)
-    table.add_column("#", style="dim", no_wrap=True, width=3)
-    table.add_column("Severity", no_wrap=True, width=8)
-    table.add_column("Source", no_wrap=True, width=12)
-    table.add_column("Location", style="cyan", overflow="fold", max_width=24)
-    table.add_column("Title", overflow="ellipsis", min_width=24, no_wrap=True)
-    table.add_column("Status", no_wrap=True, width=14)
+    table = Table(title="Findings Summary", show_lines=False, header_style="bold")
+    table.add_column("#", style="dim", no_wrap=True)
+    table.add_column("Severity", no_wrap=True)
+    table.add_column("Source", no_wrap=True)
+    table.add_column("Location", style="cyan")
+    table.add_column("Title")
+    table.add_column("Status", no_wrap=True)
 
     for idx, f in enumerate(report.findings, 1):
         sev = Text(f.severity.upper(), style=SEV_STYLE.get(f.severity, ""))
@@ -100,6 +112,30 @@ def render_summary(report: ScanReport, console: Console) -> None:
     console.print(table)
     if report.suppressed_findings:
         console.print(f"[dim]{len(report.suppressed_findings)} finding(s) suppressed or dismissed (still listed above for visibility).[/dim]")
+
+    active = report.active_findings
+    if active:
+        console.print("\n[bold]Vulnerability Details (File & Code Location):[/bold]")
+        for idx, f in enumerate(report.findings, 1):
+            if f.suppressed or f.dismissed:
+                continue
+            sev_style = SEV_STYLE.get(f.severity, "white")
+            body = (
+                f"[bold]File:[/bold] [cyan]{f.location}[/cyan]   "
+                f"[bold]Rule:[/bold] {f.rule_id}   "
+                f"[bold]Source:[/bold] {f.source_label}\n"
+                f"[bold]Code / Evidence:[/bold]\n{f.evidence or '(none)'}\n\n"
+                f"[bold]Issue:[/bold] {f.explanation}\n"
+                f"[bold]Fix:[/bold] {f.remediation}"
+            )
+            console.print(
+                Panel(
+                    body,
+                    title=f"#{idx} [{f.severity.upper()}] {f.title}",
+                    border_style=sev_style,
+                    expand=False,
+                )
+            )
 
 
 def _show_finding_detail(finding: Finding, console: Console) -> None:
@@ -189,13 +225,17 @@ def run_interactive(report: ScanReport, cfg: Config, console: Console) -> ScanRe
                 action = Prompt.ask(
                     "Finding action: [p]atch, [s]uppress (.vibegate-ignore.json), [d]ismiss for this run, [b]ack",
                     choices=["p", "s", "d", "b"],
+                    case_sensitive=False,
                     default="b",
                     console=console,
                     stream=tty,
-                )
+                ).strip().lower()
                 if action == "b":
                     break
                 if action == "p":
+                    if report.scanned_version.startswith("git:"):
+                        console.print("[yellow]Remote repo clones are temporary and already deleted; patching is only available for local paths.[/yellow]")
+                        continue
                     _handle_patch(finding, report, cfg, console, tty)
                 elif action == "d":
                     note = Prompt.ask("Reason for dismissing this run", default="reviewed", console=console, stream=tty)
@@ -204,8 +244,8 @@ def run_interactive(report: ScanReport, cfg: Config, console: Console) -> ScanRe
                     console.print("[yellow]Dismissed for this run.[/yellow]")
                     break
                 elif action == "s":
-                    if not git.find_repo_root(report.target_root) and not os.path.isdir(report.target_root):
-                        console.print("[red]Cannot write suppression file outside a workspace.[/red]")
+                    if report.scanned_version.startswith("git:") or not os.path.isdir(report.target_root):
+                        console.print("[red]Cannot write suppression file for a temporary/remote clone.[/red]")
                         continue
                     reason = Prompt.ask("Justification for suppression (recorded in .vibegate-ignore.json)", console=console, stream=tty)
                     sup = save_suppression(report.target_root, finding, reason, git.user_identity(report.target_root))

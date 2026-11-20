@@ -10,7 +10,7 @@ from vibegate import git
 from vibegate.ai import _redact_secret_lines, run_ai_review
 from vibegate.cli import main as cli_main
 from vibegate.config import Config
-from vibegate.engine import scan_staged
+from vibegate.engine import scan_remote_repo, scan_staged, scan_working_tree
 from vibegate.models import Finding
 from vibegate.patcher import apply_patch, propose_patch
 from vibegate.scanners.base import ScanTarget
@@ -165,3 +165,46 @@ def test_cli_ci_json_empty_staged(tmp_path, capsys, monkeypatch):
     payload = json.loads(capsys.readouterr().out)
     assert payload["policy"]["blocked"] is False
     assert payload["files_scanned"] == []
+
+
+def test_is_git_url_and_remote_scan(tmp_path):
+    assert git.is_git_url("https://github.com/org/repo.git")
+    assert git.is_git_url("git@github.com:org/repo.git")
+    assert not git.is_git_url("./demo")
+
+    # Create a local bare-like source repo and scan it via file:// URL (no network needed)
+    src = tmp_path / "src_repo"
+    src.mkdir()
+    root = _init_git_repo(src)
+    (src / "app.py").write_text('cur.execute(f"SELECT * FROM users WHERE id = {uid}")\n')
+    subprocess.run(["git", "add", "app.py"], cwd=root, check=True)
+    subprocess.run(["git", "commit", "-m", "add app"], cwd=root, check=True, capture_output=True)
+
+    events = []
+    report = scan_remote_repo(
+        f"file://{root}",
+        Config(scanners=["gitleaks"], ai_enabled=False),
+        progress_cb=lambda ev, msg: events.append((ev, msg)),
+    )
+    assert report.scanned_version.startswith("git:file://")
+    assert report.files_scanned == ["app.py"]
+    cleanup_msgs = [msg for ev, msg in events if ev == "cleanup_done"]
+    assert len(cleanup_msgs) == 1
+    # Extract the temp dir path inside parentheses and confirm it was deleted
+    cloned_dir = cleanup_msgs[0].split("(")[-1].rstrip(")")
+    assert not os.path.exists(cloned_dir)
+
+
+def test_scan_single_local_file_and_downloaded_folder(tmp_path):
+    folder = tmp_path / "downloaded_project"
+    folder.mkdir()
+    single_file = folder / "local_model.py"
+    single_file.write_text("x = 1\n")
+
+    r_file = scan_working_tree(str(single_file), Config(scanners=["gitleaks"], ai_enabled=False))
+    assert r_file.files_scanned == ["local_model.py"]
+    assert r_file.scanned_version.startswith("file:")
+
+    r_dir = scan_working_tree(str(folder), Config(scanners=["gitleaks"], ai_enabled=False))
+    assert r_dir.files_scanned == ["local_model.py"]
+    assert r_dir.scanned_version == "directory"

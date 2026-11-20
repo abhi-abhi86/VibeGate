@@ -3,11 +3,29 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 
 
 class GitError(RuntimeError):
     pass
+
+
+_GIT_URL_RE = re.compile(r"^(https?://|ssh://|git://|file://|git@[^:]+:).+", re.IGNORECASE)
+
+
+def is_git_url(value: str) -> bool:
+    return bool(_GIT_URL_RE.match(value.strip()))
+
+
+def clone_repo(url: str, dest: str, branch: str | None = None) -> None:
+    args = ["clone", "--depth", "1"]
+    if branch:
+        args += ["--branch", branch]
+    args += [url.strip(), dest]
+    proc = subprocess.run(["git", *args], capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise GitError(f"git clone failed: {proc.stderr.strip()}")
 
 
 def _git(args: list[str], cwd: str, check: bool = True, text: bool = True) -> str:

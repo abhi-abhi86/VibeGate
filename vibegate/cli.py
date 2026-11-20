@@ -13,10 +13,10 @@ from rich.console import Console
 
 from vibegate import __version__, git
 from vibegate.config import CONFIG_FILE, DEFAULT_TOML, load_config
-from vibegate.engine import scan_staged, scan_working_tree
+from vibegate.engine import scan_remote_repo, scan_staged, scan_working_tree
 from vibegate.models import SEVERITIES
 from vibegate.scanners import ALL_SCANNERS
-from vibegate.ui import render_summary, run_interactive
+from vibegate.ui import print_banner, render_summary, run_interactive
 
 HOOK_MARKER = "# vibegate-managed-pre-commit"
 HOOK_SCRIPT = f"""#!/usr/bin/env sh
@@ -26,18 +26,59 @@ exec vibegate scan --staged "$@"
 
 
 def cmd_scan(args: argparse.Namespace) -> int:
-    cwd = os.path.abspath(args.path)
-    repo_root = git.find_repo_root(cwd)
-    cfg = load_config(repo_root or cwd)
-    if args.fail_on:
-        cfg.fail_on = args.fail_on
-    if args.no_ai:
-        cfg.ai_enabled = False
-
-    if args.all or not repo_root:
-        report = scan_working_tree(cwd, cfg)
+    if args.json:
+        progress_cb = None
     else:
-        report = scan_staged(repo_root, cfg)
+        live_console = Console()
+        print_banner(live_console)
+        live_console.print("[bold magenta]VibeGate[/bold magenta] starting scan...")
+
+        def progress_cb(event: str, msg: str) -> None:
+            icon = "[green]✓[/green]" if event.endswith("_done") else "[cyan]•[/cyan]"
+            live_console.print(f"  {icon} {msg}")
+
+    target = (args.repo or args.path).strip()
+    if git.is_git_url(target):
+        cfg = load_config(None)
+        if args.fail_on:
+            cfg.fail_on = args.fail_on
+        if args.no_ai:
+            cfg.ai_enabled = False
+        if args.deps and "osv-scanner" not in cfg.scanners:
+            cfg.scanners.append("osv-scanner")
+        try:
+            report = scan_remote_repo(target, cfg, branch=args.branch, progress_cb=progress_cb)
+        except git.GitError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 2
+    else:
+        cwd = os.path.abspath(target)
+        if not os.path.exists(cwd):
+            print(f"Error: path not found: {cwd}", file=sys.stderr)
+            return 2
+        if os.path.isfile(cwd):
+            cfg = load_config(os.path.dirname(cwd))
+            if args.fail_on:
+                cfg.fail_on = args.fail_on
+            if args.no_ai:
+                cfg.ai_enabled = False
+            if args.deps and "osv-scanner" not in cfg.scanners:
+                cfg.scanners.append("osv-scanner")
+            report = scan_working_tree(cwd, cfg, progress_cb=progress_cb)
+        else:
+            repo_root = git.find_repo_root(cwd)
+            cfg = load_config(repo_root or cwd)
+            if args.fail_on:
+                cfg.fail_on = args.fail_on
+            if args.no_ai:
+                cfg.ai_enabled = False
+            if args.deps and "osv-scanner" not in cfg.scanners:
+                cfg.scanners.append("osv-scanner")
+
+            if args.all or not repo_root or os.path.realpath(cwd) != os.path.realpath(repo_root):
+                report = scan_working_tree(cwd, cfg, progress_cb=progress_cb)
+            else:
+                report = scan_staged(repo_root, cfg, progress_cb=progress_cb)
 
     if args.json:
         print(json.dumps(report.to_dict(), indent=2))
@@ -124,14 +165,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     sub = p.add_subparsers(dest="command", required=True)
 
-    scan = sub.add_parser("scan", help="Scan staged changes (default) or working tree")
-    scan.add_argument("path", nargs="?", default=".", help="Repository or directory path (default: .)")
-    scan.add_argument("--staged", action="store_true", help="Scan staged changes only (default inside Git repos)")
+    scan = sub.add_parser("scan", help="Scan a Git repo URL, local directory, or staged changes")
+    scan.add_argument("path", nargs="?", default=".", help="Local path or Git repository URL (default: .)")
+    scan.add_argument("--repo", help="Git repository URL to clone and scan")
+    scan.add_argument("--branch", help="Branch or tag to clone when scanning --repo / a Git URL")
+    scan.add_argument("--staged", action="store_true", help="Scan staged changes only (default inside local Git repos)")
     scan.add_argument("--all", action="store_true", help="Scan all tracked/unignored files in the working tree")
     scan.add_argument("--ci", action="store_true", help="Non-interactive mode for CI")
     scan.add_argument("--json", action="store_true", help="Emit machine-readable JSON report")
     scan.add_argument("--no-tui", action="store_true", help="Print summary without interactive prompt")
     scan.add_argument("--no-ai", action="store_true", help="Disable AI-assisted authorization review")
+    scan.add_argument("--deps", action="store_true", help="Also scan dependency manifests/lockfiles with OSV-Scanner")
     scan.add_argument("--fail-on", choices=SEVERITIES, help="Override blocking severity threshold")
     scan.set_defaults(func=cmd_scan)
 

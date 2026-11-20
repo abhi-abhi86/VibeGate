@@ -5,8 +5,9 @@ from __future__ import annotations
 import os
 import tempfile
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from typing import Callable
 
 from vibegate import git
 from vibegate.ai import AIReviewResult, run_ai_review
@@ -92,13 +93,21 @@ def _run_on_target(
     partially_staged_files: list[str],
     cfg: Config,
     start_time: float,
+    progress_cb: Callable[[str, str], None] | None = None,
 ) -> ScanReport:
+    def emit(event: str, msg: str) -> None:
+        if progress_cb:
+            progress_cb(event, msg)
+
     scanners = build_scanners(cfg.scanners)
     scanner_results: list[ScannerResult] = []
+    emit("scanners_start", f"Running {', '.join(scanners)} on {len(target.files)} file(s)...")
     with ThreadPoolExecutor(max_workers=max(1, len(scanners))) as pool:
-        futures = [pool.submit(s.run, target, cfg.scanner_timeout) for s in scanners.values()]
-        for fut in futures:
-            scanner_results.append(fut.result())
+        future_map = {pool.submit(s.run, target, cfg.scanner_timeout): name for name, s in scanners.items()}
+        for fut in as_completed(future_map):
+            res = fut.result()
+            scanner_results.append(res)
+            emit("scanner_done", f"{res.name}: {res.status} ({res.duration_ms}ms, {len(res.findings)} finding(s))")
 
     findings: list[Finding] = []
     for sr in scanner_results:
@@ -107,7 +116,9 @@ def _run_on_target(
             findings.append(f)
 
     secret_findings = [f for f in findings if f.category == "secret"]
+    emit("ai_start", "Running AI authorization review...")
     ai_res = run_ai_review(target, secret_findings, cfg)
+    emit("ai_done", f"ai-review: {ai_res.status} ({ai_res.duration_ms}ms, {len(ai_res.findings)} finding(s))")
     for f in ai_res.findings:
         f.scanned_version = target.version
         findings.append(f)
@@ -134,7 +145,9 @@ def _run_on_target(
     )
 
 
-def scan_staged(repo_root: str, cfg: Config) -> ScanReport:
+def scan_staged(
+    repo_root: str, cfg: Config, progress_cb: Callable[[str, str], None] | None = None
+) -> ScanReport:
     start = time.monotonic()
     files = git.staged_files(repo_root)
     partial = git.partially_staged(repo_root, files)
@@ -154,18 +167,26 @@ def scan_staged(repo_root: str, cfg: Config) -> ScanReport:
     with tempfile.TemporaryDirectory(prefix="vibegate-staged-") as td:
         git.checkout_index(repo_root, files, td)
         target = ScanTarget(root=td, files=files, version="staged")
-        return _run_on_target(target, repo_root, partial, cfg, start)
+        return _run_on_target(target, repo_root, partial, cfg, start, progress_cb=progress_cb)
 
 
-def scan_working_tree(path: str, cfg: Config) -> ScanReport:
+def scan_working_tree(
+    path: str, cfg: Config, progress_cb: Callable[[str, str], None] | None = None
+) -> ScanReport:
     start = time.monotonic()
     abs_path = os.path.abspath(path)
+    if os.path.isfile(abs_path):
+        parent = os.path.dirname(abs_path)
+        filename = os.path.basename(abs_path)
+        target = ScanTarget(root=parent, files=[filename], version=f"file:{abs_path}")
+        return _run_on_target(target, None, [], cfg, start, progress_cb=progress_cb)
+
     repo_root = git.find_repo_root(abs_path)
-    if repo_root:
+    if repo_root and os.path.realpath(abs_path) == os.path.realpath(repo_root):
         files = git.listed_files(repo_root)
         partial = git.partially_staged(repo_root)
         target = ScanTarget(root=repo_root, files=files, version="working tree")
-        return _run_on_target(target, repo_root, partial, cfg, start)
+        return _run_on_target(target, repo_root, partial, cfg, start, progress_cb=progress_cb)
 
     files = []
     for dirpath, dirnames, filenames in os.walk(abs_path):
@@ -173,5 +194,25 @@ def scan_working_tree(path: str, cfg: Config) -> ScanReport:
         for fn in filenames:
             files.append(os.path.relpath(os.path.join(dirpath, fn), abs_path))
     target = ScanTarget(root=abs_path, files=sorted(files), version="directory")
-    return _run_on_target(target, None, [], cfg, start)
+    return _run_on_target(target, None, [], cfg, start, progress_cb=progress_cb)
+
+
+def scan_remote_repo(
+    url: str, cfg: Config, branch: str | None = None, progress_cb: Callable[[str, str], None] | None = None
+) -> ScanReport:
+    start = time.monotonic()
+    if progress_cb:
+        progress_cb("clone_start", f"Cloning {url}...")
+    td_path = ""
+    with tempfile.TemporaryDirectory(prefix="vibegate-repo-") as td:
+        td_path = td
+        git.clone_repo(url, td, branch=branch)
+        files = git.listed_files(td)
+        if progress_cb:
+            progress_cb("clone_done", f"Cloned {len(files)} file(s) from {url}")
+        target = ScanTarget(root=td, files=files, version=f"git:{url}")
+        report = _run_on_target(target, None, [], cfg, start, progress_cb=progress_cb)
+    if progress_cb:
+        progress_cb("cleanup_done", f"Deleted temporary cloned repo ({td_path})")
+    return report
 
