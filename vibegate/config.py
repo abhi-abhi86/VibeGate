@@ -25,12 +25,12 @@ enabled = ["gitleaks", "semgrep", "osv-scanner"]
 timeout_seconds = 90
 
 [ai]
-# Optional AI authorization review. Needs GEMINI_API_KEY; disable with --no-ai or VIBEGATE_NO_AI=1.
+# Optional AI security & bug review. Needs GEMINI_API_KEY; disable with --no-ai or VIBEGATE_NO_AI=1.
 enabled = true
-model = "gemini-flash-latest"
+model = "gemini-flash-lite-latest"
 timeout_seconds = 20
-max_files = 4
-max_chars = 16000
+max_files = 8
+max_chars = 24000
 
 [verify]
 # Optional test command the developer may choose to run after applying a patch.
@@ -46,12 +46,12 @@ class Config:
     scanners: list[str] = field(default_factory=lambda: ["gitleaks", "semgrep", "osv-scanner"])
     scanner_timeout: int = 90
     ai_enabled: bool = True
-    ai_model: str = "gemini-flash-latest"
+    ai_model: str = "gemini-flash-lite-latest"
     groq_model: str = "openai/gpt-oss-120b"
     consensus_enabled: bool = False
     ai_timeout: int = 20
-    ai_max_files: int = 4
-    ai_max_chars: int = 16000
+    ai_max_files: int = 8
+    ai_max_chars: int = 24000
     test_command: str | None = None
     source_file: str | None = None
 

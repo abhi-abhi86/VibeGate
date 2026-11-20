@@ -127,7 +127,32 @@ def _run_on_target(
 
     for f in ai_res.findings:
         f.scanned_version = target.version
-        findings.append(f)
+        # Avoid duplicate panels when Semgrep already deterministically flagged the same line & category
+        overlaps = any(
+            df.file == f.file
+            and df.category == f.category
+            and df.start_line <= f.end_line
+            and f.start_line <= max(df.start_line, df.end_line)
+            for df in findings
+        )
+        if not overlaps:
+            findings.append(f)
+
+    for f in findings:
+        if f.category == "secret":
+            f.code_snippet = f.code_snippet or f.evidence
+        elif f.start_line and not f.code_snippet:
+            lines = target.read(f.file).splitlines()
+            if lines:
+                lo = max(1, f.start_line - 1)
+                hi = min(len(lines), max(f.start_line, f.end_line) + 1)
+                snippet_lines = [
+                    f"{'>>' if f.start_line <= ln <= max(f.start_line, f.end_line) else '  '} {ln:>4} | {lines[ln - 1]}"
+                    for ln in range(lo, hi + 1)
+                ]
+                f.code_snippet = "\n".join(snippet_lines)
+        elif not f.code_snippet:
+            f.code_snippet = f.evidence
 
     suppressions = load_suppressions(repo_root)
     apply_suppressions(findings, suppressions)

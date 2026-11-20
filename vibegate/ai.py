@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 import httpx
 
 from vibegate.config import Config
-from vibegate.models import AI_CANDIDATE, CONFIDENCES, SEVERITIES, Finding
+from vibegate.models import AI_CANDIDATE, CATEGORIES, CONFIDENCES, SEVERITIES, Finding
 from vibegate.scanners.base import ScanTarget
 
 ROUTE_HINTS = re.compile(
@@ -29,8 +29,8 @@ SECRET_LINE_HINTS = re.compile(
     r"(?:API_KEY|SECRET_KEY|TOKEN|PASSWORD|PRIVATE_KEY)\s*=\s*['\"][^'\"]{10,}['\"])"
 )
 
-CODE_EXTENSIONS = {".py", ".js", ".ts", ".jsx", ".tsx", ".go", ".rb", ".java", ".php", ".cs"}
-LLM_CALL_TIMEOUT = 12.0
+CODE_EXTENSIONS = {".py", ".js", ".ts", ".jsx", ".tsx", ".go", ".rb", ".java", ".php", ".cs", ".sql", ".sh", ".yml", ".yaml"}
+LLM_CALL_TIMEOUT = 15.0
 
 
 @dataclass
@@ -59,7 +59,7 @@ def _is_candidate_file(rel: str, content: str) -> bool:
         return False
     if rel.startswith("tests/") or "/tests/" in rel or rel.endswith("_test.py") or ".test." in rel:
         return False
-    return bool(ROUTE_HINTS.search(content))
+    return bool(content.strip())
 
 
 def _redact_secret_lines(content: str, secret_lines: set[int]) -> str:
@@ -78,9 +78,14 @@ def _select_context(target: ScanTarget, secret_findings: list[Finding], cfg: Con
         if f.category == "secret" and f.start_line:
             secrets_by_file.setdefault(f.file, set()).update(range(f.start_line, max(f.start_line, f.end_line) + 1))
 
+    # Prioritize route/auth/DB-relevant files first, then include other code files
+    ordered = sorted(
+        target.files,
+        key=lambda r: (0 if ROUTE_HINTS.search(target.read(r)) else 1, r),
+    )
     selected: list[tuple[str, str]] = []
     total_chars = 0
-    for rel in target.files:
+    for rel in ordered:
         if len(selected) >= cfg.ai_max_files:
             break
         raw = target.read(rel)
@@ -101,22 +106,26 @@ def _select_context(target: ScanTarget, secret_findings: list[Finding], cfg: Con
 def _build_prompt(snippets: list[tuple[str, str]]) -> str:
     files_block = "\n\n".join(f"=== FILE: {rel} ===\n{body}" for rel, body in snippets)
     return (
-        "You are a security reviewer specializing in BROKEN ACCESS CONTROL, IDOR "
-        "(Insecure Direct Object Reference), and MISSING AUTHORIZATION CHECKS that static SAST tools miss.\n"
-        "Focus specifically on:\n"
-        "- Routes/endpoints (e.g. /api/user/<id>, /orders/<order_id>) that read, update, or delete user-specific "
-        "or sensitive data without verifying authentication AND object ownership (e.g. session['user_id'] == user_id or current_user.id == id).\n"
-        "- Admin/privileged actions missing role or permission checks.\n"
+        "You are an expert application security reviewer. Inspect the provided code for ALL types of "
+        "security vulnerabilities and serious code bugs, including:\n"
+        "- Broken Access Control / IDOR / missing authentication or ownership checks\n"
+        "- Injection flaws (SQL injection, OS command injection, SSTI, XSS, NoSQL injection)\n"
+        "- SSRF (Server-Side Request Forgery) & Path Traversal\n"
+        "- Unsafe deserialization (pickle, yaml.load), weak cryptography, disabled TLS verification, hardcoded credentials\n"
+        "- Critical logic bugs, race conditions, or swallowed exceptions\n"
         "Rules:\n"
-        "- Do NOT report SQL injection, hard-coded secrets, or dependency CVEs (other tools handle those).\n"
+        "- Only report genuine, concrete vulnerabilities or bugs actually present in the provided lines; never guess or invent issues.\n"
+        "- In `reasoning`, cite the specific files, functions/routes, and checks you observed.\n"
         "- Return ONLY a strict JSON object with keys:\n"
-        '  {"is_vulnerable": bool, "findings": [...], "reasoning": "2-3 sentence explanation"}\n'
+        '  {"is_vulnerable": bool, "findings": [...], "reasoning": "2-3 sentence grounded explanation"}\n'
         "- Each finding object in findings must have:\n"
-        "  file (string), start_line (int), end_line (int), severity (high|medium|low|info),\n"
-        "  confidence (high|medium|low), title (string), evidence (short code quote),\n"
-        "  explanation (1-2 sentences), remediation (1-2 sentences),\n"
+        "  file (string), start_line (int), end_line (int),\n"
+        "  category (one of: access_control, injection, secret, bug, other),\n"
+        "  severity (critical|high|medium|low|info), confidence (high|medium|low),\n"
+        "  title (string), evidence (exact code quote from the file), explanation (1-2 sentences),\n"
+        "  impact (1 sentence on the real-world threat in this code), remediation (1-2 sentences),\n"
         "  patch_old (optional exact existing line(s) to replace), patch_new (optional replacement line(s)).\n"
-        "- If there are no likely access-control issues, set is_vulnerable=false and findings=[].\n\n"
+        "- If the code has no security vulnerabilities or serious bugs, set is_vulnerable=false and findings=[].\n\n"
         f"{files_block}"
     )
 
@@ -170,30 +179,33 @@ def _parse_verdict(raw_text: str, valid_files: set[str], scanned_version: str) -
             conf = "medium"
         start = max(1, int(it.get("start_line") or 1))
         end = max(start, int(it.get("end_line") or start))
-        raw_title = str(it.get("title") or "Missing authorization / ownership check")[:100]
-        if "access" not in raw_title.lower() and "auth" not in raw_title.lower() and "idor" not in raw_title.lower():
-            raw_title = f"Access Control: {raw_title}"
+        cat = str(it.get("category", "other")).lower()
+        if cat not in CATEGORIES or cat == "dependency":
+            cat = "access_control" if any(k in str(it.get("title", "")).lower() for k in ("auth", "idor", "access")) else "other"
+        raw_title = str(it.get("title") or "Potential security vulnerability")[:120]
         extra = {}
+        if it.get("impact"):
+            extra["impact"] = str(it["impact"])[:300]
         if it.get("patch_old") and it.get("patch_new"):
             extra["patch_old"] = str(it["patch_old"])
             extra["patch_new"] = str(it["patch_new"])
         findings.append(
             Finding(
                 source="ai-review",
-                rule_id="ai-access-control",
-                category="access_control",
+                rule_id=f"ai-{cat}",
+                category=cat,
                 severity=sev,
                 confidence=conf,
                 file=rel,
                 start_line=start,
                 end_line=end,
-                title=raw_title[:120],
+                title=raw_title,
                 evidence=str(it.get("evidence") or "")[:300],
-                explanation=str(it.get("explanation") or "AI review flagged a potential Access Control / Authorization gap."),
-                remediation=str(it.get("remediation") or "Verify authentication and object ownership before acting on the resource."),
+                explanation=str(it.get("explanation") or "AI review flagged a potential security or bug issue."),
+                remediation=str(it.get("remediation") or "Review and remediate the flagged code."),
                 ai_generated=True,
                 verification_status=AI_CANDIDATE,
-                verification_note="AI candidate Access Control finding; verify against your application's auth middleware and tests.",
+                verification_note="AI candidate finding; verify against your application logic and tests.",
                 scanned_version=scanned_version,
                 extra=extra,
             )
@@ -292,8 +304,8 @@ def run_ai_review(
     per_call_timeout = min(float(cfg.ai_timeout), LLM_CALL_TIMEOUT)
     use_consensus = cfg.consensus_enabled or bool(gemini_key and groq_key)
 
-    gemini_q = f"Are there any missing auth, IDOR, or permission checks in {files_list}?"
-    groq_q = f"Gemini reported Safe — double-check {files_list} for any hidden access-control or IDOR risks?"
+    gemini_q = f"Are there any security vulnerabilities (auth/IDOR, injection, XSS, SSRF, crypto, secrets) or code bugs in {files_list}?"
+    groq_q = f"Gemini reported Safe — double-check {files_list} for any hidden vulnerabilities or code bugs?"
 
     if not use_consensus:
         emit("ai_start", f"Layer 1 (Gemini) Q: {gemini_q}")

@@ -458,3 +458,51 @@ def test_consensus_gemini_404_falls_back_to_groq(tmp_path, monkeypatch):
     assert res.consensus_status == "single_fallback"
     assert "Groq verified no IDOR." in res.reasoning_trace["groq"]
     assert "fallback" in res.reasoning_trace["gemini"]
+
+
+def test_distinct_report_entries_per_vulnerability(tmp_path):
+    from io import StringIO
+    from rich.console import Console
+    from vibegate.ui import render_summary, threat_impact
+
+    (tmp_path / "app.py").write_text(
+        'API_KEY = "ghp_****************"\n'
+        'def q(cur, uid):\n'
+        '    cur.execute(f"SELECT * FROM u WHERE id = {uid}")\n'
+    )
+    (tmp_path / "utils.py").write_text(
+        'def parse():\n'
+        '    try:\n'
+        '        return 1\n'
+        '    except:\n'
+        '        return 0\n'
+    )
+    cfg = Config(scanners=["semgrep"], ai_enabled=False)
+    report = scan_working_tree(str(tmp_path), cfg)
+    # Add a simulated secret finding to cover multiple files & categories
+    secret_f = Finding(
+        "gitleaks", "github-pat", "secret", "critical", "high", "app.py", 1, 1,
+        "GitHub PAT", 'API_KEY = "ghp_****************"', "Hardcoded token in source.", "Move to .env.",
+        code_snippet='API_KEY = "ghp_****************"', scanned_version="git:https://example.com/repo.git",
+    )
+    report.findings.insert(0, secret_f)
+    report.scanned_version = "git:https://example.com/repo.git"
+
+    # Assert distinct code_snippet, issue, threat, and fix across findings
+    assert len(report.findings) >= 3
+    snippets = {f.code_snippet for f in report.findings}
+    threats = {threat_impact(f) for f in report.findings}
+    issues = {f.explanation for f in report.findings}
+    fixes = {f.remediation for f in report.findings}
+    assert len(snippets) == len(report.findings)
+    assert len(threats) == len(report.findings)
+    assert len(issues) == len(report.findings)
+    assert len(fixes) == len(report.findings)
+
+    buf = StringIO()
+    render_summary(report, Console(file=buf, width=120))
+    rendered = buf.getvalue()
+    assert "app.py:1" in rendered
+    assert "app.py:3" in rendered
+    assert "utils.py:2-5" in rendered
+    assert "/var/folders/" not in rendered

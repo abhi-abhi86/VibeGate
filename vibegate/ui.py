@@ -60,6 +60,8 @@ BANNER = r"""[bold magenta]
 
 def threat_impact(finding: Finding) -> str:
     """Return a plain-English explanation of what real-world threat/attack this vulnerability enables."""
+    if finding.extra.get("impact"):
+        return str(finding.extra["impact"])
     rid = finding.rule_id.lower()
     cat = finding.category
     if cat == "secret":
@@ -114,12 +116,23 @@ def threat_impact(finding: Finding) -> str:
             f"OSV advisory {ref} affects this package version. Actual impact depends on "
             "whether your code reaches the vulnerable function/path."
         )
+    if "bare-except" in rid:
+        return "Bare `except:` silently swallows unexpected errors, KeyboardInterrupt, and SystemExit, hiding crashes and security failures."
+    if "mutable-default" in rid:
+        return "Shared mutable default arguments (`[]`/`{}`) leak state between function calls or user requests, causing data corruption."
+    if "is-literal" in rid:
+        return "Using `is` instead of `==` compares memory identity rather than value, causing unpredictable logic branches."
+    if "nan-equality" in rid:
+        return "Comparing against `NaN` with `==`/`===` always evaluates to false, silently bypassing numeric validation."
+    if "assignment-in-condition" in rid:
+        return "Using `=` instead of `===` inside an `if` condition overwrites the variable and can bypass conditional checks."
+    if "flask-debug" in rid:
+        return "Flask debug mode exposes the Werkzeug interactive debugger, allowing remote code execution if reachable."
+    if "hardcoded-flask-secret" in rid:
+        return "Anyone who reads the source code can forge valid Flask session cookies and impersonate any user."
     if cat == "bug":
-        return (
-            "This code glitch can cause silent data corruption, unexpected runtime crashes, "
-            "or swallowed errors that make production failures hard to diagnose."
-        )
-    return "If reachable by untrusted input, this weakness can be abused to compromise data or availability."
+        return f"Code bug ({finding.rule_id}): can cause silent data corruption, logic bypasses, or unexpected runtime failures."
+    return f"Security weakness ({finding.rule_id}): {finding.explanation}"
 
 
 def print_banner(console: Console) -> None:
@@ -189,7 +202,11 @@ def _status_text(f: Finding) -> str:
 
 def _render_detail_panel(idx: int, f: Finding, report: ScanReport, console: Console) -> None:
     sev_style = SEV_STYLE.get(f.severity, "white")
-    full_path = os.path.join(report.target_root, f.file) if os.path.isdir(report.target_root) else f.file
+    is_temp = "/var/folders/" in report.target_root or report.target_root.startswith("/tmp/")
+    if report.scanned_version.startswith("git:") or is_temp or not os.path.isdir(report.target_root):
+        full_path = f"{f.scanned_version} -> {f.file}"
+    else:
+        full_path = os.path.join(report.target_root, f.file)
     line_info = f"Line {f.start_line}" if f.start_line else "File-level"
     if f.end_line and f.end_line != f.start_line:
         line_info = f"Lines {f.start_line}-{f.end_line}"
@@ -443,11 +460,13 @@ def render_summary(report: ScanReport, console: Console, sev_filter: str | None 
 
 def _pinpoint_code(root: str, finding: Finding) -> str:
     """Return a line-numbered code snippet pinpointing the exact vulnerable line(s)."""
+    if finding.code_snippet:
+        return finding.code_snippet
     if finding.category == "secret" or not finding.start_line:
         return finding.evidence or "(none)"
-    path = os.path.join(root, finding.file)
-    if not os.path.isfile(path):
-        return finding.evidence or "(none)"
+    path = os.path.join(root, finding.file) if root else ""
+    if not path or not os.path.isfile(path):
+        return str(finding.extra.get("code_snippet") or finding.evidence or "(none)")
     try:
         with open(path, encoding="utf-8", errors="replace") as fh:
             lines = fh.read().splitlines()

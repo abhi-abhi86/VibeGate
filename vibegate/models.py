@@ -51,6 +51,7 @@ class Finding:
     suggested_patch: str | None = None
     patch_source: str | None = None  # deterministic | ai
     scanned_version: str = "staged"
+    code_snippet: str = ""
     consensus_status: str = "single"  # 2/2_safe | 2/2_vulnerable | debate_resolved | single_fallback | single
     reasoning_trace: dict[str, str] = field(default_factory=dict)
     extra: dict = field(default_factory=dict)
