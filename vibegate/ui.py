@@ -20,6 +20,7 @@ from vibegate.config import Config
 from vibegate.engine import ScanReport, evaluate_policy
 from vibegate.models import Finding
 from vibegate.patcher import (
+    apply_all_safe_fixes,
     apply_patch,
     propose_patch,
     run_authorized_tests,
@@ -54,6 +55,63 @@ BANNER = r"""[bold magenta]
    \ V / | | |_) |  __/ |_| | (_| | ||  __/
     \_/  |_|_.__/ \___|\____|\__,_|\__\___|[/bold magenta]
 [dim]                              by team Z-ZONE[/dim]"""
+
+
+def threat_impact(finding: Finding) -> str:
+    """Return a plain-English explanation of what real-world threat/attack this vulnerability enables."""
+    rid = finding.rule_id.lower()
+    cat = finding.category
+    if cat == "secret":
+        return (
+            "Anyone with access to the repo or Git history can extract this credential to "
+            "impersonate your service, access private data, or run up unauthorized API/cloud charges."
+        )
+    if "sql" in rid:
+        return (
+            "An attacker can manipulate the SQL query through user input to bypass login, "
+            "exfiltrate sensitive database tables, or alter/delete records."
+        )
+    if any(k in rid for k in ("subprocess", "os-system", "exec", "eval", "ssti", "pickle", "yaml")):
+        return (
+            "An attacker can execute arbitrary OS commands or Python/JS code on your server "
+            "(Remote Code Execution), leading to full system compromise."
+        )
+    if "xss" in rid:
+        return (
+            "An attacker can inject malicious JavaScript into victims' browsers to hijack "
+            "sessions, steal cookies/tokens, or act on behalf of logged-in users."
+        )
+    if "ssrf" in rid:
+        return (
+            "An attacker can force your server to send requests to internal services, "
+            "private networks, or cloud metadata endpoints to steal credentials."
+        )
+    if "path-traversal" in rid:
+        return (
+            "An attacker can use `../` sequences to read or overwrite arbitrary server files "
+            "(such as `.env`, source code, or system credentials)."
+        )
+    if cat == "access_control":
+        return (
+            "A user can view, modify, or delete another user's private data without permission "
+            "(Broken Access Control / IDOR)."
+        )
+    if "tls" in rid:
+        return (
+            "Disabling certificate checks allows a network attacker to intercept or tamper "
+            "with sensitive traffic via a Man-in-the-Middle (MitM) attack."
+        )
+    if "weak-hash" in rid:
+        return (
+            "Attackers can crack weak MD5/SHA-1 hashes or forge collisions to compromise "
+            "passwords or integrity checks."
+        )
+    if cat == "dependency":
+        return (
+            "If your app reaches the affected code path, attackers can exploit this known CVE "
+            "(such as remote code execution, DoS, or data leakage)."
+        )
+    return "If reachable by untrusted input, this weakness can be abused to compromise data or availability."
 
 
 def print_banner(console: Console) -> None:
@@ -117,10 +175,20 @@ def render_summary(report: ScanReport, console: Console) -> None:
     console.print()
     header = Text()
     header.append("VibeGate ", style="bold magenta")
-    header.append(f"scanned {len(report.files_scanned)} file(s) ", style="bold")
-    header.append(f"({report.scanned_version} version) ", style="cyan")
-    header.append(f"in {report.duration_ms / 1000:.2f}s", style="dim")
+    header.append(f"scanned {len(report.files_scanned)} {report.scanned_version} file(s) ", style="bold")
+    header.append(f"in {report.duration_ms / 1000:.2f}s", style="bold cyan")
     console.print(Panel(header, expand=False, border_style="magenta"))
+
+    # Security Scorecard
+    active_count = len(report.active_findings)
+    crit_high = sum(1 for f in report.active_findings if f.severity in ("critical", "high"))
+    if report.policy_blocked:
+        score_text = f"[bold red]Security Scorecard: {active_count} Risk(s) ({crit_high} Critical/High) — BLOCKED[/bold red]"
+    elif active_count > 0:
+        score_text = f"[yellow]Security Scorecard: {active_count} Non-blocking Risk(s) — PASS[/yellow]"
+    else:
+        score_text = "[bold green]Security Scorecard: 0 Risks — SAFE TO SHIP[/bold green]"
+    console.print(score_text)
 
     if report.partially_staged_files:
         console.print(
@@ -194,6 +262,7 @@ def render_summary(report: ScanReport, console: Console) -> None:
                 f"[bold]Source:[/bold] {f.source_label}\n"
                 f"[bold]Code / Evidence:[/bold]\n{f.evidence or '(none)'}\n\n"
                 f"[bold]Issue:[/bold] {f.explanation}\n"
+                f"[bold red]Threat / Impact:[/bold red] {threat_impact(f)}\n"
                 f"[bold]Fix:[/bold] {f.remediation}"
             )
             console.print(
@@ -223,6 +292,8 @@ def _show_finding_detail(finding: Finding, console: Console) -> None:
     lines.append(f"[bold]Evidence:[/bold]\n{finding.evidence or '(none)'}")
     lines.append("")
     lines.append(f"[bold]Explanation:[/bold]\n{finding.explanation}")
+    lines.append("")
+    lines.append(f"[bold red]Threat / Impact:[/bold red]\n{threat_impact(finding)}")
     lines.append("")
     lines.append(f"[bold]Suggested remediation:[/bold]\n{finding.remediation}")
     console.print(Panel("\n".join(lines), title=finding.title, border_style=SEV_STYLE.get(finding.severity, "white")))
@@ -275,10 +346,39 @@ def run_interactive(report: ScanReport, cfg: Config, console: Console) -> ScanRe
 
     try:
         while True:
-            console.print("\nActions: [bold]<number>[/bold] inspect finding, [bold]r[/bold] refresh summary, [bold]q[/bold] finish")
+            console.print(
+                "\nActions: [bold][A][/bold] Apply all safe fixes & re-stage, "
+                "[bold]<number>[/bold] inspect finding, [bold]r[/bold] refresh, [bold]q[/bold] finish"
+            )
             choice = Prompt.ask("vibegate", default="q", console=console, stream=tty).strip().lower()
             if choice in ("q", "quit", "exit", ""):
                 break
+            if choice == "a":
+                if report.scanned_version.startswith("git:"):
+                    console.print("[yellow]Remote repo clones are temporary; auto-patch is only available for local paths.[/yellow]")
+                    continue
+                before_n = len(report.active_findings)
+                applied, skipped = apply_all_safe_fixes(
+                    report.target_root,
+                    report.active_findings,
+                    partially_staged_files=report.partially_staged_files,
+                    restage=True,
+                )
+                for prop in applied:
+                    console.print(f"  [green]✓ Fixed[/green] {prop.file}: {prop.description}")
+                for msg in skipped:
+                    console.print(f"  [yellow]• Skipped[/yellow] {msg}")
+                # Rescan each finding to verify
+                for f in report.active_findings:
+                    if f.source in ("gitleaks", "semgrep", "osv-scanner"):
+                        verify_finding_recheck(report.target_root, f, timeout=cfg.scanner_timeout)
+                remaining = [f for f in report.active_findings if f.verification_status != "no_longer_reproduces"]
+                console.print(
+                    f"\n[bold]Scorecard:[/bold] Before: [red]{before_n} Risk(s)[/red]  ->  "
+                    f"After: [{'green' if not remaining else 'yellow'}]{len(remaining)} Remaining Risk(s)"
+                    f"{' (Safe to Ship)' if not remaining else ''}[/]"
+                )
+                continue
             if choice == "r":
                 render_summary(report, console)
                 continue

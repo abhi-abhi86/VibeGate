@@ -12,7 +12,7 @@ from vibegate.cli import main as cli_main
 from vibegate.config import Config
 from vibegate.engine import scan_remote_repo, scan_staged, scan_working_tree
 from vibegate.models import Finding
-from vibegate.patcher import apply_patch, propose_patch
+from vibegate.patcher import apply_all_safe_fixes, apply_patch, propose_patch
 from vibegate.scanners.base import ScanTarget
 from vibegate.scanners.gitleaks import GitleaksScanner, mask
 from vibegate.scanners.osv import OSVScanner
@@ -220,3 +220,62 @@ def test_cli_rules_and_doctor(capsys):
     doc_out = capsys.readouterr().out
     assert "gitleaks:" in doc_out
     assert "semgrep:" in doc_out
+
+
+def test_parallel_execution_and_offline_ai_fallback(tmp_path, monkeypatch):
+    import urllib.error
+
+    def fake_urlopen(*_args, **_kwargs):
+        raise urllib.error.URLError("offline")
+
+    monkeypatch.setenv("GEMINI_API_KEY", "dummy-key")
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+    (tmp_path / "app.py").write_text('@app.route("/api/user/<int:user_id>")\ndef get_u(user_id): return {}\n')
+    report = scan_working_tree(str(tmp_path), Config(scanners=["gitleaks"], ai_enabled=True))
+    assert report.ai_result.status == "unavailable"
+    assert len(report.scanner_results) == 1
+    assert report.duration_ms >= 0
+
+
+def test_vibegate_init_creates_config_and_hook(tmp_path, monkeypatch):
+    root = _init_git_repo(tmp_path)
+    monkeypatch.chdir(root)
+    assert cli_main(["init"]) == 0
+    assert (tmp_path / ".vibegate.toml").is_file()
+    assert (tmp_path / ".git" / "hooks" / "pre-commit").is_file()
+
+
+def test_one_keystroke_auto_patcher_all_four_types(tmp_path):
+    root = _init_git_repo(tmp_path)
+    app_file = tmp_path / "app.py"
+    req_file = tmp_path / "requirements.txt"
+    secret = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+    app_file.write_text(
+        f'GITHUB_TOKEN = "{secret}"\n'
+        'def q(cur, customer):\n'
+        '    cur.execute(f"SELECT * FROM orders WHERE customer = \'{customer}\'")\n'
+        '@app.route("/api/user/<int:user_id>")\n'
+        'def get_u(user_id):\n'
+        '    return jsonify({"id": user_id})\n'
+    )
+    req_file.write_text("PyYAML==5.3.1\n")
+    subprocess.run(["git", "add", "app.py", "requirements.txt"], cwd=root, check=True)
+
+    findings = [
+        Finding("gitleaks", "github-pat", "secret", "critical", "high", "app.py", 1, 1, "Secret", "", "", ""),
+        Finding("semgrep", "python-sql-injection-fstring", "injection", "high", "high", "app.py", 3, 3, "SQLi", "", "", ""),
+        Finding("semgrep", "python-flask-route-missing-auth", "access_control", "high", "medium", "app.py", 4, 6, "IDOR", "", "", ""),
+        Finding("osv-scanner", "GHSA-test", "dependency", "high", "high", "requirements.txt", 1, 1, "PyYAML", "", "", "", extra={"package": "PyYAML", "fixed_versions": ["5.4"]}),
+    ]
+    applied, skipped = apply_all_safe_fixes(root, findings, restage=True)
+    assert len(applied) == 4
+    assert skipped == []
+
+    patched_app = app_file.read_text()
+    assert 'os.getenv("GITHUB_TOKEN", "")' in patched_app
+    assert "WHERE customer = ?" in patched_app
+    assert 'session.get("user_id") != user_id' in patched_app
+    assert "PyYAML>=5.4" in req_file.read_text()
+    assert f"GITHUB_TOKEN={secret}" in (tmp_path / ".env").read_text()
+    assert "GITHUB_TOKEN=" in (tmp_path / ".env.example").read_text()

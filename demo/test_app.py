@@ -1,6 +1,6 @@
+import os
 import sqlite3
 import tempfile
-import os
 
 from demo.app import app
 
@@ -25,3 +25,11 @@ def test_search_orders_returns_200():
         if os.path.exists(path):
             os.remove(path)
 
+
+def test_authorized_user_profile_returns_200():
+    client = app.test_client()
+    with client.session_transaction() as sess:
+        sess["user_id"] = 1
+    resp = client.get("/api/user/1")
+    assert resp.status_code == 200
+    assert resp.get_json()["email"] == "alice@example.com"

@@ -21,7 +21,7 @@ ai_findings_block = false
 block_on_scanner_error = false
 
 [scanners]
-enabled = ["gitleaks", "semgrep"]
+enabled = ["gitleaks", "semgrep", "osv-scanner"]
 timeout_seconds = 90
 
 [ai]
@@ -43,7 +43,7 @@ class Config:
     fail_on: str = "high"
     ai_findings_block: bool = False
     block_on_scanner_error: bool = False
-    scanners: list[str] = field(default_factory=lambda: ["gitleaks", "semgrep"])
+    scanners: list[str] = field(default_factory=lambda: ["gitleaks", "semgrep", "osv-scanner"])
     scanner_timeout: int = 90
     ai_enabled: bool = True
     ai_model: str = "gemini-2.5-flash"

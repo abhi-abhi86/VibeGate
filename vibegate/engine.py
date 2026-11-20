@@ -101,24 +101,28 @@ def _run_on_target(
 
     scanners = build_scanners(cfg.scanners)
     scanner_results: list[ScannerResult] = []
-    emit("scanners_start", f"Running {', '.join(scanners)} on {len(target.files)} file(s)...")
-    with ThreadPoolExecutor(max_workers=max(1, len(scanners))) as pool:
-        future_map = {pool.submit(s.run, target, cfg.scanner_timeout): name for name, s in scanners.items()}
-        for fut in as_completed(future_map):
-            res = fut.result()
-            scanner_results.append(res)
-            emit("scanner_done", f"{res.name}: {res.status} ({res.duration_ms}ms, {len(res.findings)} finding(s))")
+    ai_res: AIReviewResult | None = None
+    emit("scanners_start", f"Running {', '.join(scanners)} + ai-review concurrently on {len(target.files)} file(s)...")
+    with ThreadPoolExecutor(max_workers=max(2, len(scanners) + 1)) as pool:
+        scanner_futs = {pool.submit(s.run, target, cfg.scanner_timeout): name for name, s in scanners.items()}
+        ai_fut = pool.submit(run_ai_review, target, [], cfg)
+        all_futs = list(scanner_futs.keys()) + [ai_fut]
+        for fut in as_completed(all_futs):
+            if fut is ai_fut:
+                ai_res = fut.result()
+                emit("ai_done", f"ai-review: {ai_res.status} ({ai_res.duration_ms}ms, {len(ai_res.findings)} finding(s))")
+            else:
+                res = fut.result()
+                scanner_results.append(res)
+                emit("scanner_done", f"{res.name}: {res.status} ({res.duration_ms}ms, {len(res.findings)} finding(s))")
 
+    assert ai_res is not None
     findings: list[Finding] = []
     for sr in scanner_results:
         for f in sr.findings:
             f.scanned_version = target.version
             findings.append(f)
 
-    secret_findings = [f for f in findings if f.category == "secret"]
-    emit("ai_start", "Running AI authorization review...")
-    ai_res = run_ai_review(target, secret_findings, cfg)
-    emit("ai_done", f"ai-review: {ai_res.status} ({ai_res.duration_ms}ms, {len(ai_res.findings)} finding(s))")
     for f in ai_res.findings:
         f.scanned_version = target.version
         findings.append(f)

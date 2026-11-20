@@ -12,7 +12,7 @@ license = { text = "Apache-2.0" }
 dependencies = ["rich>=13.0"]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0"]
+dev = ["pytest>=8.0", "flask>=2.3"]
 
 [project.scripts]
 vibegate = "vibegate.cli:main"
@@ -25,4 +25,5 @@ vibegate = ["rules/*.yml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]
 

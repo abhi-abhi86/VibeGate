@@ -18,8 +18,14 @@ ROUTE_HINTS = re.compile(
     r"(@app\.route|@router\.|@bp\.route|app\.(get|post|put|patch|delete)\(|"
     r"router\.(get|post|put|patch|delete)\(|def\s+(get|post|put|delete|update|remove)_|"
     r"login_required|current_user|session\[|Authorization|Bearer|SELECT\s+.+\s+FROM|"
-    r"WHERE\s+id\s*=|order_id|user_id|account_id)",
+    r"WHERE\s+id\s*=|order_id|user_id|account_id|/api/)",
     re.IGNORECASE,
+)
+
+# Pre-redaction patterns so secrets are stripped even when AI runs concurrently with Gitleaks
+SECRET_LINE_HINTS = re.compile(
+    r"(ghp_[A-Za-z0-9]{20,}|sk_live_[A-Za-z0-9]{16,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z\-_]{20,}|"
+    r"(?:API_KEY|SECRET_KEY|TOKEN|PASSWORD|PRIVATE_KEY)\s*=\s*['\"][^'\"]{10,}['\"])"
 )
 
 CODE_EXTENSIONS = {".py", ".js", ".ts", ".jsx", ".tsx", ".go", ".rb", ".java", ".php", ".cs"}
@@ -51,12 +57,10 @@ def _is_candidate_file(rel: str, content: str) -> bool:
 
 
 def _redact_secret_lines(content: str, secret_lines: set[int]) -> str:
-    if not secret_lines:
-        return content
     out = []
     for idx, line in enumerate(content.splitlines(), 1):
-        if idx in secret_lines:
-            out.append("[REDACTED: line flagged by secret scanner]")
+        if idx in secret_lines or SECRET_LINE_HINTS.search(line):
+            out.append("[REDACTED: potential secret]")
         else:
             out.append(line)
     return "\n".join(out)
@@ -91,16 +95,19 @@ def _select_context(target: ScanTarget, secret_findings: list[Finding], cfg: Con
 def _build_prompt(snippets: list[tuple[str, str]]) -> str:
     files_block = "\n\n".join(f"=== FILE: {rel} ===\n{body}" for rel, body in snippets)
     return (
-        "You are reviewing staged code changes for LIKELY missing authentication, "
-        "object-level authorization (IDOR), or permission checks.\n"
+        "You are a security reviewer specializing in BROKEN ACCESS CONTROL, IDOR "
+        "(Insecure Direct Object Reference), and MISSING AUTHORIZATION CHECKS that static SAST tools miss.\n"
+        "Focus specifically on:\n"
+        "- Routes/endpoints (e.g. /api/user/<id>, /orders/<order_id>) that read, update, or delete user-specific "
+        "or sensitive data without verifying authentication AND object ownership (e.g. session['user_id'] == user_id or current_user.id == id).\n"
+        "- Admin/privileged actions missing role or permission checks.\n"
         "Rules:\n"
-        "- Only report concrete, high-signal access-control concerns visible in the provided code.\n"
-        "- Do NOT report SQL injection, secrets, or dependency issues (other tools handle those).\n"
-        "- Remember your output is a candidate finding for human review, not a confirmed vulnerability.\n"
-        "- Return ONLY a JSON object with a single key \"findings\", which is a list of objects with keys:\n"
-        "  file (string), start_line (int), end_line (int), severity (one of: high, medium, low, info),\n"
-        "  confidence (one of: high, medium, low), title (string), evidence (short quote/detail),\n"
-        "  explanation (plain English, 1-2 sentences), remediation (plain English, 1-2 sentences).\n"
+        "- Do NOT report SQL injection, hard-coded secrets, or dependency CVEs (other tools handle those).\n"
+        "- Return ONLY a JSON object with a single key \"findings\", a list of objects with keys:\n"
+        "  file (string), start_line (int), end_line (int), severity (high|medium|low|info),\n"
+        "  confidence (high|medium|low), title (string), evidence (short code quote),\n"
+        "  explanation (1-2 sentences), remediation (1-2 sentences),\n"
+        "  patch_old (optional exact existing line(s) to replace), patch_new (optional replacement line(s) adding the minimal auth/ownership check).\n"
         "- If there are no likely access-control issues, return {\"findings\": []}.\n\n"
         f"{files_block}"
     )
@@ -127,6 +134,13 @@ def _parse_findings(raw_text: str, valid_files: set[str], scanned_version: str) 
             conf = "medium"
         start = max(1, int(it.get("start_line") or 1))
         end = max(start, int(it.get("end_line") or start))
+        raw_title = str(it.get("title") or "Missing authorization / ownership check")[:100]
+        if "access" not in raw_title.lower() and "auth" not in raw_title.lower() and "idor" not in raw_title.lower():
+            raw_title = f"Access Control: {raw_title}"
+        extra = {}
+        if it.get("patch_old") and it.get("patch_new"):
+            extra["patch_old"] = str(it["patch_old"])
+            extra["patch_new"] = str(it["patch_new"])
         findings.append(
             Finding(
                 source="ai-review",
@@ -137,14 +151,15 @@ def _parse_findings(raw_text: str, valid_files: set[str], scanned_version: str) 
                 file=rel,
                 start_line=start,
                 end_line=end,
-                title=str(it.get("title") or "Possible missing authorization check")[:120],
+                title=raw_title[:120],
                 evidence=str(it.get("evidence") or "")[:300],
-                explanation=str(it.get("explanation") or "AI review flagged a potential access-control gap."),
+                explanation=str(it.get("explanation") or "AI review flagged a potential Access Control / Authorization gap."),
                 remediation=str(it.get("remediation") or "Verify authentication and object ownership before acting on the resource."),
                 ai_generated=True,
                 verification_status=AI_CANDIDATE,
-                verification_note="AI candidate finding; verify against your application's auth middleware and tests.",
+                verification_note="AI candidate Access Control finding; verify against your application's auth middleware and tests.",
                 scanned_version=scanned_version,
+                extra=extra,
             )
         )
     return findings
@@ -186,6 +201,8 @@ def run_ai_review(target: ScanTarget, secret_findings: list[Finding], cfg: Confi
         return AIReviewResult("ok", findings, f"reviewed {len(snippets)} file(s) with {cfg.ai_model}", ms)
     except TimeoutError:
         return AIReviewResult("timeout", [], f"AI review timed out after {cfg.ai_timeout}s", int((time.monotonic() - start) * 1000))
+    except urllib.error.HTTPError as exc:
+        return AIReviewResult("unavailable", [], f"AI review HTTP {exc.code} ({exc.reason}); deterministic results shown", int((time.monotonic() - start) * 1000))
     except urllib.error.URLError as exc:
         return AIReviewResult("unavailable", [], f"AI review unavailable ({exc.reason}); deterministic results shown", int((time.monotonic() - start) * 1000))
     except Exception as exc:

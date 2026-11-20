@@ -17,6 +17,7 @@ from vibegate.engine import scan_remote_repo, scan_staged, scan_working_tree
 from vibegate.models import SEVERITIES
 from vibegate.scanners import ALL_SCANNERS
 from vibegate.scanners.semgrep import RULES_PATH
+from vibegate.patcher import apply_all_safe_fixes
 from vibegate.suppress import SUPPRESS_FILE, load_suppressions
 from vibegate.ui import LiveScanDisplay, print_banner, render_summary, run_interactive
 
@@ -91,6 +92,21 @@ def cmd_scan(args: argparse.Namespace) -> int:
         return result
 
     report = result
+    if args.auto_fix and not report.scanned_version.startswith("git:"):
+        before_n = len(report.active_findings)
+        applied, skipped = apply_all_safe_fixes(
+            report.target_root,
+            report.active_findings,
+            partially_staged_files=report.partially_staged_files,
+            restage=True,
+        )
+        for prop in applied:
+            console.print(f"  [green]✓ Auto-fixed[/green] {prop.file}: {prop.description}")
+        for msg in skipped:
+            console.print(f"  [yellow]• Skipped[/yellow] {msg}")
+        console.print(f"[bold]Applied {len(applied)} safe fix(es) (Before: {before_n} risk(s)).[/bold]")
+        return 0 if applied else (1 if report.policy_blocked else 0)
+
     if args.output:
         with open(args.output, "w", encoding="utf-8") as fh:
             json.dump(report.to_dict(), fh, indent=2)
@@ -148,11 +164,14 @@ def cmd_init(args: argparse.Namespace) -> int:
     root = git.find_repo_root(".") or os.getcwd()
     path = os.path.join(root, CONFIG_FILE)
     if os.path.exists(path) and not args.force:
-        print(f"{path} already exists (use --force to overwrite).", file=sys.stderr)
-        return 2
-    with open(path, "w", encoding="utf-8") as fh:
-        fh.write(DEFAULT_TOML)
-    print(f"Wrote {path}")
+        print(f"{path} already exists (leaving existing config).")
+    else:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(DEFAULT_TOML)
+        print(f"Wrote {path}")
+
+    if git.find_repo_root(root):
+        return cmd_hook(argparse.Namespace(hook_action="install", force=args.force))
     return 0
 
 
@@ -256,6 +275,7 @@ def build_parser() -> argparse.ArgumentParser:
     scan.add_argument("--no-tui", action="store_true", help="Print summary without interactive prompt")
     scan.add_argument("--no-ai", action="store_true", help="Disable AI-assisted authorization review")
     scan.add_argument("--deps", action="store_true", help="Also scan dependency manifests/lockfiles with OSV-Scanner")
+    scan.add_argument("--auto-fix", action="store_true", help="Apply all available safe fixes and re-stage")
     scan.add_argument("--output", "-o", help="Save JSON scan report to a file")
     scan.add_argument("--fail-on", choices=SEVERITIES, help="Override blocking severity threshold")
     scan.set_defaults(func=cmd_scan)

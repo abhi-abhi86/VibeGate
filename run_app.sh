@@ -11,8 +11,41 @@ if [ ! -x "$VIBEGATE_BIN" ]; then
   "$VENV_DIR/bin/pip" install -e "$ROOT_DIR[dev]"
 fi
 
+run_live_demo() {
+  DEMO_TMP="$(mktemp -d "${TMPDIR:-/tmp}/vibegate-demo-XXXXXX")"
+  trap 'rm -rf "$DEMO_TMP"' EXIT
+  cp -R "$ROOT_DIR/demo/." "$DEMO_TMP/"
+  mkdir -p "$DEMO_TMP/demo"
+  cp "$ROOT_DIR/demo/app.py" "$DEMO_TMP/demo/app.py"
+  touch "$DEMO_TMP/demo/__init__.py"
+  git -C "$DEMO_TMP" init -q
+  git -C "$DEMO_TMP" config user.email "demo@z-zone.dev"
+  git -C "$DEMO_TMP" config user.name "Z-ZONE Demo"
+  git -C "$DEMO_TMP" add app.py requirements.txt
+
+  echo "=== [1/4] Scanning staged demo files (Before Auto-Patch) ==="
+  "$VIBEGATE_BIN" scan "$DEMO_TMP" --staged --no-tui --deps || true
+
+  echo ""
+  echo "=== [2/4] Applying one-keystroke auto-fixes & re-staging ==="
+  "$VIBEGATE_BIN" scan "$DEMO_TMP" --staged --auto-fix --deps --no-ai
+
+  echo ""
+  echo "=== [3/4] Re-scanning staged files (After Auto-Patch) ==="
+  "$VIBEGATE_BIN" scan "$DEMO_TMP" --staged --no-tui --deps --no-ai || true
+
+  echo ""
+  echo "=== [4/4] Running functional tests on patched app ==="
+  cp "$DEMO_TMP/app.py" "$DEMO_TMP/demo/app.py"
+  PYTHONPATH="$DEMO_TMP" "$VENV_DIR/bin/pytest" -q "$DEMO_TMP/test_app.py"
+}
+
 if [ "$#" -gt 0 ]; then
   case "$1" in
+    demo)
+      run_live_demo
+      exit 0
+      ;;
     scan|hook|init|doctor|rules|suppressions|-h|--help|--version)
       exec "$VIBEGATE_BIN" "$@"
       ;;
@@ -38,7 +71,8 @@ echo "  2) Local project folder / downloaded directory"
 echo "  3) Single local file path (e.g. an unuploaded file on your system)"
 echo "  4) Check environment & scanners (doctor)"
 echo "  5) List built-in security rules (rules)"
-printf "Choose [1/2/3/4/5] or paste a Git URL / path directly: "
+echo "  6) Run 90-second live demo (demo)"
+printf "Choose [1-6] or paste a Git URL / path directly: "
 IFS= read -r CHOICE
 case "$CHOICE" in
   1)
@@ -58,6 +92,10 @@ case "$CHOICE" in
     ;;
   5)
     exec "$VIBEGATE_BIN" rules
+    ;;
+  6)
+    run_live_demo
+    exit 0
     ;;
   *)
     TARGET="$CHOICE"

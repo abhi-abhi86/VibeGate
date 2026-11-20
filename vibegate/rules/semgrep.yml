@@ -309,3 +309,88 @@ rules:
       - pattern: $APP.secret_key = "..."
       - pattern: $APP.config["SECRET_KEY"] = "..."
 
+  # ---------------------------------------------------------------- AI-Boilerplate Access Control & DB Rules
+  - id: python-flask-route-missing-auth
+    languages: [python]
+    severity: ERROR
+    message: >-
+      Flask route handles a user-specific resource ID without checking session/current_user ownership
+      or using an auth decorator (potential IDOR / Broken Access Control).
+    metadata:
+      title: "Access Control: Flask route missing ownership/auth check"
+      vibegate_category: access_control
+      vibegate_severity: high
+      confidence: MEDIUM
+      cwe: "CWE-639: Authorization Bypass Through User-Controlled Key"
+      remediation: Verify that the authenticated user owns the requested resource ID before returning or modifying data.
+    patterns:
+      - pattern-either:
+          - pattern: |
+              @$APP.route("...<...$ID>...", ...)
+              def $FN(..., $ID, ...):
+                  ...
+          - pattern: |
+              @$APP.route("...<...$ID>...", ...)
+              def $FN(..., $ID: $T, ...):
+                  ...
+      - metavariable-regex:
+          metavariable: $ID
+          regex: (?i).*(user_id|account_id|order_id|profile_id|id)$
+      - pattern-not-inside: |
+          @login_required
+          def $FN(...):
+              ...
+      - pattern-not: |
+          @$APP.route(...)
+          def $FN(...):
+              ...
+              session.get(...)
+              ...
+      - pattern-not: |
+          @$APP.route(...)
+          def $FN(...):
+              ...
+              current_user
+              ...
+
+  - id: python-fastapi-route-missing-auth
+    languages: [python]
+    severity: WARNING
+    message: >-
+      FastAPI route accepts a user/account/order ID path parameter without an auth dependency (Depends(...)).
+    metadata:
+      title: "Access Control: FastAPI route missing Depends() auth"
+      vibegate_category: access_control
+      vibegate_severity: medium
+      confidence: MEDIUM
+      cwe: "CWE-862: Missing Authorization"
+      remediation: Add an authentication/authorization dependency via Depends(get_current_user) and verify ownership.
+    patterns:
+      - pattern: |
+          @$APP.$METHOD("...{$ID}...", ...)
+          def $FN(..., $ID: $T, ...):
+              ...
+      - metavariable-regex:
+          metavariable: $ID
+          regex: (?i).*(user_id|account_id|order_id|profile_id)$
+      - pattern-not: |
+          @$APP.$METHOD(...)
+          def $FN(..., $USER = Depends(...), ...):
+              ...
+
+  - id: nosql-wildcard-public-rule
+    languages: [generic]
+    severity: ERROR
+    message: Public wildcard read/write rule exposes the entire database to any unauthenticated user.
+    metadata:
+      title: Insecure public wildcard database rule
+      vibegate_category: access_control
+      vibegate_severity: critical
+      confidence: HIGH
+      cwe: "CWE-284: Improper Access Control"
+      remediation: Restrict read/write rules to authenticated users who own the document (e.g., request.auth.uid == userId).
+    pattern-either:
+      - pattern: "allow read, write: if true;"
+      - pattern: '".read": true'
+      - pattern: '".write": true'
+
