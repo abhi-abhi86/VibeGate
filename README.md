@@ -16,6 +16,12 @@ VibeGate automatically detects your project stack (**Django**, **Flask**, **Fast
 
 ![VibeGate Terminal Output](./docs/vibegate-terminal.jpg)
 
+### Multi-File Threat Table & Pinpointed Impact
+
+When vulnerabilities are detected, VibeGate lists findings across **every file** in the project—complete with a **`How to Access / Example`** column showing concrete exploit vectors (such as SQL injection inputs, XSS payloads, and unauthenticated endpoints) alongside **Pinpointed Code Threats & Impact** cards with the exact vulnerable lines, plain-English threat explanation, and remediation:
+
+![VibeGate Multi-File Threats & Pinpointed Impact](./docs/vibegate-findings.jpg)
+
 ## Quick Start
 
 Run the launcher script (automatically creates `.venv` and installs VibeGate on first run):
