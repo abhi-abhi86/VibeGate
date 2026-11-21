@@ -14,7 +14,7 @@ A local-first security gate for AI-generated code. VibeGate scans **remote Git r
 
 VibeGate automatically detects your project stack (**Django**, **Flask**, **FastAPI**, **Express**), applies framework-specific rules and AI guidance across all files, shows the exact file, line, pinpointed code snippet, **How to Access / Example** exploit vector, and **Threat / Impact** in plain English, supports one-keystroke auto-fixing (`[A] Apply all safe fixes & re-stage`), and reruns checks after a change.
 
-![VibeGate Terminal Output](docs/vibegate-demo.jpg)
+![VibeGate Terminal Output](./docs/vibegate-terminal.jpg)
 
 ## Quick Start
 
