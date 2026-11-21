@@ -4,14 +4,15 @@
   \ \ / /| | '_ \ / _ \ |  _ / _` | __/ _ \
    \ V / | | |_) |  __/ |_| | (_| | ||  __/
     \_/  |_|_.__/ \___|\____|\__,_|\__\___|
-                              by team Z-ZONE
+ ⚡ Pre-Commit & Repo Security Gate • SAST · Secrets · SCA · 2-Layer AI
+    by team Z-ZONE
 ```
 
 # VibeGate
 
-A local-first security gate for AI-generated code. VibeGate scans **remote Git repositories**, **local/downloaded folders**, **single unuploaded files**, or **staged Git changes** before a commit—combining deterministic cybersecurity scanners (**Gitleaks**, **Semgrep**) with an optional **Gemini** authorization review for context-dependent access-control gaps (like IDORs).
+A local-first security gate for AI-generated code. VibeGate scans **remote Git repositories**, **local/downloaded folders**, **single unuploaded files**, **staged Git changes** (pre-commit), or **outgoing commits** (`git push` pre-push)—combining deterministic cybersecurity scanners (**Gitleaks**, **Semgrep**, **OSV-Scanner**) with **2-Layer Multi-LLM Consensus** (**Gemini + Groq**).
 
-VibeGate does not claim to prove code is secure; it helps catch high-signal cybersecurity threats early, shows the exact file, line, and pinpointed code snippet, explains the **Threat / Impact** in plain English, supports one-keystroke auto-fixing (`[A] Apply all safe fixes & re-stage`), and reruns checks after a change.
+VibeGate automatically detects your project stack (**Django**, **Flask**, **FastAPI**, **Express**), applies framework-specific rules and AI guidance across all files, shows the exact file, line, pinpointed code snippet, **How to Access / Example** exploit vector, and **Threat / Impact** in plain English, supports one-keystroke auto-fixing (`[A] Apply all safe fixes & re-stage`), and reruns checks after a change.
 
 ![VibeGate Terminal Output](docs/vibegate-demo.jpg)
 
