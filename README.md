@@ -22,6 +22,12 @@ When vulnerabilities are detected, VibeGate lists findings across **every file**
 
 ![VibeGate Multi-File Threats & Pinpointed Impact](./docs/vibegate-findings.jpg)
 
+### Live 2-Layer AI Reasoning & Multi-Batch Consensus
+
+On full repositories, VibeGate batches all candidate files and streams its **2-Layer AI Reasoning** live—asking **Layer 1 (Gemini)** per file batch, escalating to **Layer 2 (Groq)** for a second opinion when Layer 1 reports safe, and automatically failing over between models on rate limits or timeouts so no file is skipped:
+
+![VibeGate Live 2-Layer AI Reasoning](./docs/vibegate-reasoning.jpg)
+
 ## Quick Start
 
 Run the launcher script (automatically creates `.venv` and installs VibeGate on first run):
