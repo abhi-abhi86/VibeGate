@@ -54,10 +54,15 @@ class AIReviewResult:
 
 
 def _is_candidate_file(rel: str, content: str) -> bool:
-    _, ext = os.path.splitext(rel.lower())
+    norm = rel.replace("\\", "/").lower()
+    _, ext = os.path.splitext(norm)
     if ext not in CODE_EXTENSIONS:
         return False
-    if rel.startswith("tests/") or "/tests/" in rel or rel.endswith("_test.py") or ".test." in rel:
+    if norm.startswith("tests/") or "/tests/" in norm or norm.endswith("_test.py") or ".test." in norm:
+        return False
+    if norm.endswith((".min.js", ".min.css")) or any(
+        seg in norm for seg in ("/vendor/", "/node_modules/", "/dist/", "/build/", "/.venv/")
+    ):
         return False
     return bool(content.strip())
 
@@ -72,48 +77,67 @@ def _redact_secret_lines(content: str, secret_lines: set[int]) -> str:
     return "\n".join(out)
 
 
-def _select_context(target: ScanTarget, secret_findings: list[Finding], cfg: Config) -> list[tuple[str, str]]:
+def _select_batches(target: ScanTarget, secret_findings: list[Finding], cfg: Config) -> list[list[tuple[str, str]]]:
+    """Group all candidate code files into prompt-sized batches so no file is dropped."""
     secrets_by_file: dict[str, set[int]] = {}
     for f in secret_findings:
         if f.category == "secret" and f.start_line:
             secrets_by_file.setdefault(f.file, set()).update(range(f.start_line, max(f.start_line, f.end_line) + 1))
 
-    # Prioritize route/auth/DB-relevant files first, then include other code files
+    # Prioritize route/auth/DB-relevant files first, then include all other code files
     ordered = sorted(
         target.files,
         key=lambda r: (0 if ROUTE_HINTS.search(target.read(r)) else 1, r),
     )
-    selected: list[tuple[str, str]] = []
-    total_chars = 0
+
+    max_files_per_batch = max(1, cfg.ai_max_files)
+    max_chars_per_batch = max(1000, cfg.ai_max_chars)
+    batches: list[list[tuple[str, str]]] = []
+    current_batch: list[tuple[str, str]] = []
+    current_chars = 0
+
     for rel in ordered:
-        if len(selected) >= cfg.ai_max_files:
-            break
         raw = target.read(rel)
         if not raw.strip() or not _is_candidate_file(rel, raw):
             continue
         redacted = _redact_secret_lines(raw, secrets_by_file.get(rel, set()))
         numbered = "\n".join(f"{i}: {ln}" for i, ln in enumerate(redacted.splitlines(), 1))
-        if total_chars + len(numbered) > cfg.ai_max_chars:
-            remaining = cfg.ai_max_chars - total_chars
-            if remaining < 400:
-                break
-            numbered = numbered[:remaining] + "\n... [truncated]"
-        selected.append((rel, numbered))
-        total_chars += len(numbered)
-    return selected
+        if len(numbered) > max_chars_per_batch:
+            numbered = numbered[:max_chars_per_batch] + "\n... [truncated]"
+
+        if current_batch and (len(current_batch) >= max_files_per_batch or current_chars + len(numbered) > max_chars_per_batch):
+            batches.append(current_batch)
+            current_batch = []
+            current_chars = 0
+
+        current_batch.append((rel, numbered))
+        current_chars += len(numbered)
+
+    if current_batch:
+        batches.append(current_batch)
+    return batches
 
 
-def _build_prompt(snippets: list[tuple[str, str]]) -> str:
+def _select_context(target: ScanTarget, secret_findings: list[Finding], cfg: Config) -> list[tuple[str, str]]:
+    batches = _select_batches(target, secret_findings, cfg)
+    return batches[0] if batches else []
+
+
+def _build_prompt(snippets: list[tuple[str, str]], stack_guidance: str = "") -> str:
     files_block = "\n\n".join(f"=== FILE: {rel} ===\n{body}" for rel, body in snippets)
+    stack_section = f"\nFRAMEWORK / STACK CONTEXT:\n{stack_guidance}\n" if stack_guidance else ""
     return (
         "You are an expert application security reviewer. Inspect the provided code for ALL types of "
         "security vulnerabilities and serious code bugs, including:\n"
+        f"{stack_section}"
         "- Broken Access Control / IDOR / missing authentication or ownership checks\n"
         "- Injection flaws (SQL injection, OS command injection, SSTI, XSS, NoSQL injection)\n"
         "- SSRF (Server-Side Request Forgery) & Path Traversal\n"
         "- Unsafe deserialization (pickle, yaml.load), weak cryptography, disabled TLS verification, hardcoded credentials\n"
         "- Critical logic bugs, race conditions, or swallowed exceptions\n"
         "Rules:\n"
+        "- Inspect EVERY provided file and EVERY function/route/line from top to bottom.\n"
+        "- Do NOT stop after finding an issue in one file — list ALL distinct vulnerabilities and serious bugs across ALL provided files.\n"
         "- Only report genuine, concrete vulnerabilities or bugs actually present in the provided lines; never guess or invent issues.\n"
         "- In `reasoning`, cite the specific files, functions/routes, and checks you observed.\n"
         "- Return ONLY a strict JSON object with keys:\n"
@@ -124,6 +148,7 @@ def _build_prompt(snippets: list[tuple[str, str]]) -> str:
         "  severity (critical|high|medium|low|info), confidence (high|medium|low),\n"
         "  title (string), evidence (exact code quote from the file), explanation (1-2 sentences),\n"
         "  impact (1 sentence on the real-world threat in this code), remediation (1-2 sentences),\n"
+        "  access_example (short 1-line example of how an attacker accesses/exploits it, e.g. \"?id=1' OR '1'='1' --\" or \"?q=<script>alert(1)</script>\" or \"GET /api/user/2 without auth\"),\n"
         "  patch_old (optional exact existing line(s) to replace), patch_new (optional replacement line(s)).\n"
         "- If the code has no security vulnerabilities or serious bugs, set is_vulnerable=false and findings=[].\n\n"
         f"{files_block}"
@@ -151,6 +176,18 @@ def _build_judge_prompt(
     )
 
 
+def _resolve_valid_file(raw_file: str, valid_files: set[str]) -> str | None:
+    rel = raw_file.strip().lstrip("./")
+    if rel in valid_files:
+        return rel
+    if raw_file.strip() in valid_files:
+        return raw_file.strip()
+    matches = [vf for vf in valid_files if vf == rel or vf.endswith("/" + rel) or os.path.basename(vf) == rel]
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
 def _parse_verdict(raw_text: str, valid_files: set[str], scanned_version: str) -> tuple[bool, list[Finding], str]:
     text = raw_text.strip()
     if text.startswith("```"):
@@ -168,8 +205,8 @@ def _parse_verdict(raw_text: str, valid_files: set[str], scanned_version: str) -
     for it in items:
         if not isinstance(it, dict):
             continue
-        rel = str(it.get("file", "")).strip()
-        if rel not in valid_files:
+        rel = _resolve_valid_file(str(it.get("file", "")), valid_files)
+        if not rel:
             continue
         sev = str(it.get("severity", "medium")).lower()
         if sev not in SEVERITIES:
@@ -186,6 +223,8 @@ def _parse_verdict(raw_text: str, valid_files: set[str], scanned_version: str) -
         extra = {}
         if it.get("impact"):
             extra["impact"] = str(it["impact"])[:300]
+        if it.get("access_example"):
+            extra["access_example"] = str(it["access_example"])[:200]
         if it.get("patch_old") and it.get("patch_new"):
             extra["patch_old"] = str(it["patch_old"])
             extra["patch_new"] = str(it["patch_new"])
@@ -275,34 +314,21 @@ def _attach_consensus(findings: list[Finding], status: str, trace: dict[str, str
     return findings
 
 
-def run_ai_review(
-    target: ScanTarget,
-    secret_findings: list[Finding],
+def _review_batch(
+    snippets: list[tuple[str, str]],
+    scanned_version: str,
     cfg: Config,
-    progress_cb=None,
+    gemini_key: str,
+    groq_key: str,
+    per_call_timeout: float,
+    use_consensus: bool,
+    stack_guidance: str,
+    emit,
+    start: float,
 ) -> AIReviewResult:
-    def emit(event: str, msg: str) -> None:
-        if progress_cb:
-            progress_cb(event, msg)
-
-    start = time.monotonic()
-    if not cfg.ai_enabled:
-        return AIReviewResult("skipped", [], "AI review disabled (--no-ai or config)")
-
-    gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
-    groq_key = os.environ.get("GROQ_API_KEY", "").strip()
-    if not gemini_key:
-        return AIReviewResult("unavailable", [], "GEMINI_API_KEY not set; AI authorization review skipped")
-
-    snippets = _select_context(target, secret_findings, cfg)
-    if not snippets:
-        return AIReviewResult("skipped", [], "no route/controller/auth-relevant code in staged changes")
-
     valid_files = {rel for rel, _ in snippets}
     files_list = ", ".join(sorted(valid_files))
-    prompt = _build_prompt(snippets)
-    per_call_timeout = min(float(cfg.ai_timeout), LLM_CALL_TIMEOUT)
-    use_consensus = cfg.consensus_enabled or bool(gemini_key and groq_key)
+    prompt = _build_prompt(snippets, stack_guidance=stack_guidance)
 
     gemini_q = f"Are there any security vulnerabilities (auth/IDOR, injection, XSS, SSRF, crypto, secrets) or code bugs in {files_list}?"
     groq_q = f"Gemini reported Safe — double-check {files_list} for any hidden vulnerabilities or code bugs?"
@@ -310,7 +336,7 @@ def run_ai_review(
     if not use_consensus:
         emit("ai_start", f"Layer 1 (Gemini) Q: {gemini_q}")
         try:
-            _is_vuln, findings, reasoning = _call_gemini(prompt, gemini_key, cfg.ai_model, valid_files, target.version, per_call_timeout)
+            _is_vuln, findings, reasoning = _call_gemini(prompt, gemini_key, cfg.ai_model, valid_files, scanned_version, per_call_timeout)
             trace = {"gemini_q": gemini_q, "gemini": reasoning} if reasoning else {"gemini_q": gemini_q}
             _attach_consensus(findings, "single", trace)
             ms = int((time.monotonic() - start) * 1000)
@@ -331,7 +357,7 @@ def run_ai_review(
     g_verdict = None
     g_err = None
     try:
-        g_verdict = _call_gemini(prompt, gemini_key, cfg.ai_model, valid_files, target.version, per_call_timeout)
+        g_verdict = _call_gemini(prompt, gemini_key, cfg.ai_model, valid_files, scanned_version, per_call_timeout)
     except httpx.TimeoutException:
         g_err = f"timed out after {per_call_timeout}s"
     except httpx.HTTPStatusError as exc:
@@ -346,7 +372,7 @@ def run_ai_review(
         fallback_q = f"Gemini failed ({g_err}) — review {files_list} for missing auth or IDOR risks?"
         emit("ai_start", f"Layer 2 (Groq) Q: {fallback_q}")
         try:
-            q_vuln, q_findings, q_reason = _call_groq(prompt, groq_key, cfg.groq_model, valid_files, target.version, per_call_timeout)
+            q_vuln, q_findings, q_reason = _call_groq(prompt, groq_key, cfg.groq_model, valid_files, scanned_version, per_call_timeout)
             trace = {"gemini_q": gemini_q, "gemini": f"fallback ({g_err})", "groq_q": fallback_q, "groq": q_reason}
             final_findings = q_findings if q_vuln else []
             _attach_consensus(final_findings, "single_fallback", trace)
@@ -368,7 +394,7 @@ def run_ai_review(
     emit("ai_done", f"Layer 1 (Gemini) answered: No vulnerabilities — escalating to Layer 2 (Groq)")
     emit("ai_start", f"Layer 2 (Groq) Q: {groq_q}")
     try:
-        q_vuln, q_findings, q_reason = _call_groq(prompt, groq_key, cfg.groq_model, valid_files, target.version, per_call_timeout)
+        q_vuln, q_findings, q_reason = _call_groq(prompt, groq_key, cfg.groq_model, valid_files, scanned_version, per_call_timeout)
     except Exception as exc:
         # Hard fallback: Groq timeout / 429 / JSON failure never crashes the gate
         trace = {"gemini_q": gemini_q, "gemini": g_reason, "groq_q": groq_q, "groq": f"fallback ({type(exc).__name__}: {exc})"}
@@ -392,7 +418,7 @@ def run_ai_review(
     emit("ai_start", f"Judge (Gemini) Q: {judge_q}")
     judge_prompt = _build_judge_prompt(snippets, g_verdict, (q_vuln, q_findings, q_reason))
     try:
-        j_vuln, j_findings, j_reason = _call_gemini(judge_prompt, gemini_key, cfg.ai_model, valid_files, target.version, per_call_timeout)
+        j_vuln, j_findings, j_reason = _call_gemini(judge_prompt, gemini_key, cfg.ai_model, valid_files, scanned_version, per_call_timeout)
         trace["judge_q"] = judge_q
         trace["judge"] = j_reason
         final_findings = j_findings if j_vuln else []
@@ -404,3 +430,87 @@ def run_ai_review(
         trace["judge"] = f"judge fallback ({type(exc).__name__}: {exc})"
         ms = int((time.monotonic() - start) * 1000)
         return AIReviewResult("ok", [], "Judge unavailable; using Gemini Safe verdict", ms, "single_fallback", trace)
+
+
+def run_ai_review(
+    target: ScanTarget,
+    secret_findings: list[Finding],
+    cfg: Config,
+    progress_cb=None,
+    stack_guidance: str = "",
+) -> AIReviewResult:
+    def emit(event: str, msg: str) -> None:
+        if progress_cb:
+            progress_cb(event, msg)
+
+    start = time.monotonic()
+    if not cfg.ai_enabled:
+        return AIReviewResult("skipped", [], "AI review disabled (--no-ai or config)")
+
+    gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    groq_key = os.environ.get("GROQ_API_KEY", "").strip()
+    if not gemini_key:
+        return AIReviewResult("unavailable", [], "GEMINI_API_KEY not set; AI authorization review skipped")
+
+    batches = _select_batches(target, secret_findings, cfg)
+    if not batches:
+        return AIReviewResult("skipped", [], "no route/controller/auth-relevant code in staged changes")
+
+    per_call_timeout = min(float(cfg.ai_timeout), LLM_CALL_TIMEOUT)
+    use_consensus = cfg.consensus_enabled or bool(gemini_key and groq_key)
+
+    if len(batches) == 1:
+        return _review_batch(
+            batches[0],
+            target.version,
+            cfg,
+            gemini_key,
+            groq_key,
+            per_call_timeout,
+            use_consensus,
+            stack_guidance,
+            emit,
+            start,
+        )
+
+    total_files = sum(len(b) for b in batches)
+    with ThreadPoolExecutor(max_workers=min(4, len(batches))) as pool:
+        results = list(
+            pool.map(
+                lambda b: _review_batch(
+                    b,
+                    target.version,
+                    cfg,
+                    gemini_key,
+                    groq_key,
+                    per_call_timeout,
+                    use_consensus,
+                    stack_guidance,
+                    emit,
+                    start,
+                ),
+                batches,
+            )
+        )
+
+    ok_results = [r for r in results if r.status == "ok"]
+    ms = int((time.monotonic() - start) * 1000)
+    if not ok_results:
+        return results[0]
+
+    all_findings = _deduplicate_findings([f for r in ok_results for f in r.findings])
+    merged_trace: dict[str, str] = {}
+    for idx, r in enumerate(ok_results, 1):
+        for k, v in r.reasoning_trace.items():
+            key = k if len(ok_results) == 1 else f"batch{idx}_{k}"
+            merged_trace[key] = v
+
+    consensus = ok_results[0].consensus_status if all(r.consensus_status == ok_results[0].consensus_status for r in ok_results) else "single"
+    return AIReviewResult(
+        "ok",
+        all_findings,
+        f"reviewed {total_files} file(s) across {len(batches)} batch(es) with {cfg.ai_model}",
+        ms,
+        consensus,
+        merged_trace,
+    )

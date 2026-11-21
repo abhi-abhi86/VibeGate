@@ -12,8 +12,10 @@ from typing import Callable
 from vibegate import git
 from vibegate.ai import AIReviewResult, run_ai_review
 from vibegate.config import Config
+from vibegate.detect import detect_stacks, stack_ai_guidance, stack_rule_paths
 from vibegate.models import Finding, sev_rank
 from vibegate.scanners import ScannerResult, ScanTarget, build_scanners
+from vibegate.scanners.semgrep import SemgrepScanner
 from vibegate.suppress import Suppression, apply_suppressions, load_suppressions
 
 
@@ -28,6 +30,7 @@ class ScanReport:
     ai_result: AIReviewResult
     suppressions_loaded: list[Suppression] = field(default_factory=list)
     ref_summaries: list[dict] = field(default_factory=list)
+    detected_stacks: list[str] = field(default_factory=list)
     duration_ms: int = 0
     policy_fail_on: str = "high"
     policy_blocked: bool = False
@@ -45,6 +48,7 @@ class ScanReport:
         return {
             "version": "0.1.0",
             "scanned_version": self.scanned_version,
+            "detected_stacks": self.detected_stacks,
             "files_scanned": self.files_scanned,
             "partially_staged_files": self.partially_staged_files,
             "duration_ms": self.duration_ms,
@@ -101,13 +105,18 @@ def _run_on_target(
         if progress_cb:
             progress_cb(event, msg)
 
+    stacks = detect_stacks(target)
     scanners = build_scanners(cfg.scanners)
+    if "semgrep" in scanners:
+        scanners["semgrep"] = SemgrepScanner(configs=stack_rule_paths(stacks))
+    guidance = stack_ai_guidance(stacks)
+
     scanner_results: list[ScannerResult] = []
     ai_res: AIReviewResult | None = None
     emit("scanners_start", f"Running {', '.join(scanners)} + ai-review concurrently on {len(target.files)} file(s)...")
     with ThreadPoolExecutor(max_workers=max(2, len(scanners) + 1)) as pool:
         scanner_futs = {pool.submit(s.run, target, cfg.scanner_timeout): name for name, s in scanners.items()}
-        ai_fut = pool.submit(run_ai_review, target, [], cfg, progress_cb=progress_cb)
+        ai_fut = pool.submit(run_ai_review, target, [], cfg, progress_cb=progress_cb, stack_guidance=guidance)
         all_futs = list(scanner_futs.keys()) + [ai_fut]
         for fut in as_completed(all_futs):
             if fut is ai_fut:
@@ -127,10 +136,9 @@ def _run_on_target(
 
     for f in ai_res.findings:
         f.scanned_version = target.version
-        # Avoid duplicate panels when Semgrep already deterministically flagged the same line & category
+        # Avoid duplicate panels when a deterministic scanner already flagged the same file & line range
         overlaps = any(
             df.file == f.file
-            and df.category == f.category
             and df.start_line <= f.end_line
             and f.start_line <= max(df.start_line, df.end_line)
             for df in findings
@@ -169,6 +177,7 @@ def _run_on_target(
         scanner_results=scanner_results,
         ai_result=ai_res,
         suppressions_loaded=suppressions,
+        detected_stacks=stacks,
         duration_ms=int((time.monotonic() - start_time) * 1000),
         policy_fail_on=cfg.fail_on,
         policy_blocked=blocked,

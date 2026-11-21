@@ -1,0 +1,24 @@
+rules:
+  - id: vibegate.express.cors-wildcard
+    pattern-either:
+      - pattern: 'cors({ ..., origin: "*", ... })'
+      - pattern: '$RES.setHeader("Access-Control-Allow-Origin", "*")'
+    message: Express CORS wildcard origin '*' allows any external origin to read responses.
+    languages: [javascript, typescript]
+    severity: WARNING
+    metadata:
+      category: config
+      remediation: "Restrict CORS origin to an explicit allowlist of trusted origins."
+
+  - id: vibegate.express.open-redirect
+    pattern-either:
+      - pattern: $RES.redirect($REQ.query.$PARAM)
+      - pattern: $RES.redirect($REQ.params.$PARAM)
+      - pattern: $RES.redirect($REQ.body.$PARAM)
+    message: Express res.redirect() called with unvalidated request input risks an open redirect.
+    languages: [javascript, typescript]
+    severity: WARNING
+    metadata:
+      category: injection
+      remediation: "Validate redirect targets against an allowlist of relative paths or trusted hostnames."
+

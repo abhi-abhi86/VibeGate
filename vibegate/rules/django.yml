@@ -1,0 +1,85 @@
+rules:
+  - id: vibegate.django.debug-enabled
+    patterns:
+      - pattern: DEBUG = True
+    message: Django DEBUG=True exposes detailed stack traces, settings, and SQL queries in error pages.
+    languages: [python]
+    severity: WARNING
+    metadata:
+      category: config
+      remediation: "Set DEBUG = os.environ.get('DJANGO_DEBUG', 'False').lower() == 'true' in settings.py."
+
+  - id: vibegate.django.allowed-hosts-wildcard
+    patterns:
+      - pattern: "ALLOWED_HOSTS = ['*']"
+    message: "Django ALLOWED_HOSTS = ['*'] disables HTTP Host header validation."
+    languages: [python]
+    severity: WARNING
+    metadata:
+      category: config
+      remediation: "Restrict ALLOWED_HOSTS to explicit domain names loaded from environment configuration."
+
+  - id: vibegate.django.csrf-exempt
+    patterns:
+      - pattern: |
+          @csrf_exempt
+          def $FUNC(...):
+              ...
+    message: "@csrf_exempt disables Django CSRF protection on this view."
+    languages: [python]
+    severity: WARNING
+    metadata:
+      category: auth
+      remediation: "Remove @csrf_exempt or enforce token/signature authentication for non-browser API clients."
+
+  - id: vibegate.django.raw-sql-extra
+    pattern-either:
+      - pattern: $QS.extra(...)
+      - pattern: RawSQL(...)
+    message: Django .extra() / RawSQL() bypasses ORM parameterization and risks SQL injection.
+    languages: [python]
+    severity: ERROR
+    metadata:
+      category: injection
+      remediation: "Replace .extra() / RawSQL() with Django ORM annotations, F()/Q() expressions, or parameterized queries."
+
+  - id: vibegate.django.missing-login-required
+    paths:
+      include:
+        - "*views*.py"
+    patterns:
+      - pattern: |
+          def $VIEW(request, ...):
+              ...
+      - pattern-not: |
+          @login_required
+          def $VIEW(request, ...):
+              ...
+      - pattern-not: |
+          @login_required(...)
+          def $VIEW(request, ...):
+              ...
+      - pattern-either:
+          - pattern-inside: |
+              def $VIEW(request, ...):
+                  ...
+                  request.POST
+                  ...
+          - pattern-inside: |
+              def $VIEW(request, ...):
+                  ...
+                  $MODEL.objects.$METHOD(...)
+                  ...
+      - pattern-not-inside: |
+          def $VIEW(request, ...):
+              ...
+              if not request.user.is_authenticated:
+                  ...
+              ...
+    message: Django view accesses models or POST data without @login_required or an explicit authentication check.
+    languages: [python]
+    severity: WARNING
+    metadata:
+      category: auth
+      remediation: "Add @login_required and verify object ownership (e.g., get_object_or_404(Model, pk=id, owner=request.user))."
+

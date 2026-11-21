@@ -1,0 +1,21 @@
+rules:
+  - id: vibegate.flask.debug-enabled
+    patterns:
+      - pattern: $APP.run(..., debug=True, ...)
+    message: Flask debug=True enables the interactive Werkzeug debugger and arbitrary code execution if exposed.
+    languages: [python]
+    severity: WARNING
+    metadata:
+      category: config
+      remediation: "Set debug=False in production or load from os.environ.get('FLASK_DEBUG') == '1'."
+
+  - id: vibegate.flask.ssti-render-template-string
+    patterns:
+      - pattern: render_template_string($TMPL, ...)
+    message: render_template_string() can lead to Server-Side Template Injection (SSTI) if any input reaches the template string.
+    languages: [python]
+    severity: ERROR
+    metadata:
+      category: injection
+      remediation: "Use render_template() with a static template file and pass user data as template context variables."
+

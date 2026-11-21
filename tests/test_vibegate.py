@@ -506,3 +506,153 @@ def test_distinct_report_entries_per_vulnerability(tmp_path):
     assert "app.py:3" in rendered
     assert "utils.py:2-5" in rendered
     assert "/var/folders/" not in rendered
+
+
+def test_detect_stacks_django_flask_fastapi_express(tmp_path):
+    from vibegate.detect import detect_stacks
+
+    dj = tmp_path / "dj"
+    dj.mkdir()
+    (dj / "manage.py").write_text("import django\n")
+    (dj / "settings.py").write_text("DEBUG = True\n")
+    assert detect_stacks(ScanTarget(root=str(dj), files=["manage.py", "settings.py"], version="working")) == ["django"]
+
+    fl = tmp_path / "fl"
+    fl.mkdir()
+    (fl / "app.py").write_text("from flask import Flask\napp = Flask(__name__)\n")
+    assert detect_stacks(ScanTarget(root=str(fl), files=["app.py"], version="working")) == ["flask"]
+
+    fa = tmp_path / "fa"
+    fa.mkdir()
+    (fa / "requirements.txt").write_text("fastapi==0.115.0\nuvicorn\n")
+    (fa / "main.py").write_text("print('hi')\n")
+    assert detect_stacks(ScanTarget(root=str(fa), files=["requirements.txt", "main.py"], version="working")) == ["fastapi"]
+
+    ex = tmp_path / "ex"
+    ex.mkdir()
+    (ex / "package.json").write_text('{"name": "api", "dependencies": {"express": "^4.19.0"}}\n')
+    (ex / "index.js").write_text("console.log('hi');\n")
+    assert detect_stacks(ScanTarget(root=str(ex), files=["package.json", "index.js"], version="working")) == ["express"]
+
+
+def test_stack_rule_paths_and_django_semgrep_rules(tmp_path):
+    from vibegate.detect import stack_rule_paths
+
+    paths = stack_rule_paths(["django"])
+    assert any(p.endswith("semgrep.yml") for p in paths)
+    assert any(p.endswith("django.yml") for p in paths)
+    assert not any(p.endswith("flask.yml") for p in paths)
+
+    (tmp_path / "manage.py").write_text("#!/usr/bin/env python\n")
+    (tmp_path / "settings.py").write_text("DEBUG = True\nALLOWED_HOSTS = ['*']\n")
+    (tmp_path / "views.py").write_text(
+        "from django.views.decorators.csrf import csrf_exempt\n"
+        "from django.db.models.expressions import RawSQL\n"
+        "@csrf_exempt\n"
+        "def update_item(request):\n"
+        "    return Item.objects.annotate(val=RawSQL('SELECT 1', []))\n"
+    )
+    report = scan_working_tree(str(tmp_path), Config(scanners=["semgrep"], ai_enabled=False))
+    assert report.detected_stacks == ["django"]
+    rule_ids = {f.rule_id for f in report.findings}
+    assert "debug-enabled" in rule_ids
+    assert "allowed-hosts-wildcard" in rule_ids
+    assert "csrf-exempt" in rule_ids
+    assert "raw-sql-extra" in rule_ids
+    assert "missing-login-required" in rule_ids
+
+
+def test_ai_prompt_includes_stack_guidance(tmp_path, monkeypatch):
+    from vibegate.detect import stack_ai_guidance
+
+    monkeypatch.setenv("GEMINI_API_KEY", "g-key")
+    (tmp_path / "views.py").write_text("def profile(request, pk):\n    pass\n")
+    target = ScanTarget(root=str(tmp_path), files=["views.py"], version="staged")
+    captured_prompts: list[str] = []
+
+    def fake_post(url, **kwargs):
+        captured_prompts.append(json.dumps(kwargs.get("json", {})))
+        return _MockHTTPResponse(_gemini_payload({"is_vulnerable": False, "findings": [], "reasoning": "Safe."}))
+
+    monkeypatch.setattr("httpx.post", fake_post)
+    guidance = stack_ai_guidance(["django"])
+    res = run_ai_review(target, [], Config(ai_enabled=True, consensus_enabled=False), stack_guidance=guidance)
+    assert res.status == "ok"
+    assert captured_prompts
+    assert "This is a Django project" in captured_prompts[0]
+    assert "get_object_or_404(Model, pk=id, owner=request.user)" in captured_prompts[0]
+
+
+def test_ai_review_covers_all_files_across_batches_and_skips_vendor(tmp_path, monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "g-key")
+    (tmp_path / "CollegeERP").mkdir()
+    (tmp_path / "CollegeERP" / "settings.py").write_text("DEBUG = True\n")
+    (tmp_path / "info").mkdir()
+    (tmp_path / "info" / "views.py").write_text("def edit(request):\n    pass\n")
+    (tmp_path / "info" / "models.py").write_text("class Student:\n    pass\n")
+    (tmp_path / "info" / "static" / "vendor").mkdir(parents=True)
+    (tmp_path / "info" / "static" / "vendor" / "jquery.dataTables.min.js").write_text("var x=1;\n")
+
+    target = ScanTarget(
+        root=str(tmp_path),
+        files=[
+            "CollegeERP/settings.py",
+            "info/views.py",
+            "info/models.py",
+            "info/static/vendor/jquery.dataTables.min.js",
+        ],
+        version="working",
+    )
+
+    def fake_post(url, **kwargs):
+        prompt = kwargs["json"]["contents"][0]["parts"][0]["text"]
+        # Return a finding using basename for settings.py to also verify _resolve_valid_file
+        if "CollegeERP/settings.py" in prompt:
+            f = {"file": "settings.py", "start_line": 1, "end_line": 1, "severity": "high", "confidence": "high", "title": "Debug True", "evidence": "DEBUG = True", "explanation": "Debug on", "remediation": "Set False"}
+        elif "info/views.py" in prompt:
+            f = {"file": "info/views.py", "start_line": 1, "end_line": 1, "severity": "high", "confidence": "high", "title": "Missing Auth", "evidence": "def edit", "explanation": "No auth", "remediation": "Add @login_required"}
+        else:
+            f = {"file": "info/models.py", "start_line": 1, "end_line": 1, "severity": "medium", "confidence": "medium", "title": "Model Issue", "evidence": "class Student", "explanation": "Weak field", "remediation": "Fix field"}
+        return _MockHTTPResponse(_gemini_payload({"is_vulnerable": True, "findings": [f], "reasoning": "Reviewed file."}))
+
+    monkeypatch.setattr("httpx.post", fake_post)
+    cfg = Config(ai_enabled=True, consensus_enabled=False, ai_max_files=1)
+    res = run_ai_review(target, [], cfg)
+    assert res.status == "ok"
+    found_files = {f.file for f in res.findings}
+    assert found_files == {"CollegeERP/settings.py", "info/views.py", "info/models.py"}
+
+
+def test_table_renders_access_example_column_after_status(tmp_path):
+    from io import StringIO
+    from rich.console import Console
+    from vibegate.ai import AIReviewResult
+    from vibegate.engine import ScanReport
+    from vibegate.ui import render_summary
+
+    f1 = Finding(
+        "ai-review", "ai-injection", "injection", "high", "high", "login/login.php", 11, 11,
+        "SQL Injection in Login Query", "$q = \"SELECT * FROM users WHERE user='$u'\"",
+        "Unsanitized input in SQL query.", "Use prepared statements.",
+        extra={"access_example": "POST user=' OR '1'='1' --"},
+    )
+    f2 = Finding(
+        "ai-review", "ai-xss", "injection", "medium", "medium", "pages/contact.php", 121, 121,
+        "Reflected Cross-Site Scripting (XSS)", "echo $_GET['msg'];",
+        "Unescaped GET parameter.", "Use htmlspecialchars().",
+    )
+    report = ScanReport(
+        target_root=str(tmp_path),
+        scanned_version="working",
+        files_scanned=["login/login.php", "pages/contact.php"],
+        partially_staged_files=[],
+        findings=[f1, f2],
+        scanner_results=[],
+        ai_result=AIReviewResult("ok", [f1, f2], "ok"),
+    )
+    buf = StringIO()
+    render_summary(report, Console(file=buf, width=180))
+    rendered = buf.getvalue()
+    assert "How to Access / Example" in rendered
+    assert "POST user=' OR '1'='1' --" in rendered
+    assert "<script>alert(1)</script>" in rendered

@@ -1,0 +1,17 @@
+rules:
+  - id: vibegate.fastapi.cors-wildcard
+    patterns:
+      - pattern: |
+          $APP.add_middleware(
+              CORSMiddleware,
+              ...,
+              allow_origins=["*"],
+              ...
+          )
+    message: FastAPI CORSMiddleware configured with allow_origins=["*"] permits any origin to make cross-origin requests.
+    languages: [python]
+    severity: WARNING
+    metadata:
+      category: config
+      remediation: "Restrict allow_origins to explicit trusted frontend domains."
+

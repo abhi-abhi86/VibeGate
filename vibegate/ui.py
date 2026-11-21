@@ -49,13 +49,18 @@ STATUS_LABELS = {
     "patched_tests_failed": "patched (tests fail)",
 }
 
-BANNER = r"""[bold magenta]
- __     ___ _           ____       _       
- \ \   / (_) |__   ___ / ___| __ _| |_ ___ 
-  \ \ / /| | '_ \ / _ \ |  _ / _` | __/ _ \
-   \ V / | | |_) |  __/ |_| | (_| | ||  __/
-    \_/  |_|_.__/ \___|\____|\__,_|\__\___|[/bold magenta]
-[dim]                              by team Z-ZONE[/dim]"""
+BANNER_LINES = [
+    (r" __     ___ _           ____       _       ", "bold bright_cyan"),
+    (r" \ \   / (_) |__   ___ / ___| __ _| |_ ___ ", "bold cyan"),
+    (r"  \ \ / /| | '_ \ / _ \ |  _ / _` | __/ _ \ ", "bold bright_blue"),
+    (r"   \ V / | | |_) |  __/ |_| | (_| | ||  __/", "bold magenta"),
+    (r"    \_/  |_|_.__/ \___|\____|\__,_|\__\___|", "bold bright_magenta"),
+]
+
+BANNER = "\n".join(f"[{style}]{line}[/{style}]" for line, style in BANNER_LINES) + (
+    "\n[dim]  Pre-Commit & Repo Security Gate  •  SAST + Secrets + SCA + 2-Layer AI[/dim]"
+    "\n[bold cyan]  by team Z-ZONE[/bold cyan]"
+)
 
 
 def threat_impact(finding: Finding) -> str:
@@ -135,8 +140,62 @@ def threat_impact(finding: Finding) -> str:
     return f"Security weakness ({finding.rule_id}): {finding.explanation}"
 
 
+def access_example(finding: Finding) -> str:
+    """Return a concise example of how the vulnerability can be accessed or exploited."""
+    if finding.extra.get("access_example"):
+        return str(finding.extra["access_example"]).strip()
+
+    rid = finding.rule_id.lower()
+    title = finding.title.lower()
+    text = f"{rid} {title}"
+    cat = finding.category
+
+    if cat == "secret" or any(k in text for k in ("secret", "token", "api_key", "private_key", "hardcoded")):
+        return "Read exposed credential directly from source or git history"
+    if any(k in text for k in ("sql", "rawsql", "extra")):
+        return "Input like: ' OR '1'='1' -- (bypasses query / dumps rows)"
+    if any(k in text for k in ("ssti", "render_template_string")):
+        return "Payload like: {{7*7}} or {{config.items()}} in template input"
+    if any(k in text for k in ("xss", "cross-site scripting", "innerhtml", "document.write", "html")):
+        return "Payload like: ?q=<script>alert(1)</script> in reflected input"
+    if any(k in text for k in ("command", "shell", "subprocess", "os.system", "eval", "exec")):
+        return "Payload like: ; id && whoami in command/eval input"
+    if any(k in text for k in ("path traversal", "traversal", "send_file")):
+        return "Param like: ?file=../../etc/passwd"
+    if any(k in text for k in ("ssrf", "requests", "urllib")):
+        return "URL like: http://169.254.169.254/latest/meta-data/"
+    if any(k in text for k in ("md5", "sha1", "weak password", "weak hash", "crypto")):
+        return "Crack leaked hash offline via rainbow table / hashcat"
+    if any(k in text for k in ("pickle", "yaml", "deserializ", "unserialize")):
+        return "Send crafted serialized payload to trigger remote code execution"
+    if cat == "access_control" or any(k in text for k in ("idor", "auth", "login", "csrf", "ownership")):
+        return "Call endpoint directly or swap ID (e.g. ?id=2) without auth"
+    if any(k in text for k in ("debug", "allowed_hosts", "cors")):
+        return "Trigger error page or cross-origin request to read internals"
+    return f"Send untrusted input reaching {finding.location}"
+
+
 def print_banner(console: Console) -> None:
-    console.print(BANNER)
+    logo = Text()
+    for line, style in BANNER_LINES:
+        logo.append(line + "\n", style=style)
+    tagline = Text.assemble(
+        ("⚡ ", "bold yellow"),
+        ("Pre-Commit & Repo Security Gate", "bold white"),
+        ("  •  ", "dim"),
+        ("SAST · Secrets · SCA · 2-Layer AI", "cyan"),
+        ("\n", ""),
+        ("   by team Z-ZONE", "bold magenta"),
+    )
+    console.print(
+        Panel(
+            Group(logo, tagline),
+            box=box.ROUNDED,
+            border_style="bright_cyan",
+            padding=(0, 2),
+            expand=False,
+        )
+    )
 
 
 class LiveScanDisplay:
@@ -275,6 +334,10 @@ def render_summary(report: ScanReport, console: Console, sev_filter: str | None 
         "Target",
         f"{target_label} scanned in [bold cyan]{report.duration_ms / 1000:.2f}s[/bold cyan]",
     )
+    if report.detected_stacks:
+        from vibegate.detect import STACK_LABELS
+        stack_str = ", ".join(STACK_LABELS.get(s, s) for s in report.detected_stacks)
+        summary_grid.add_row("Stack", f"[cyan]{stack_str}[/cyan]")
     summary_grid.add_row("Scorecard", score_text)
     summary_grid.add_row("Scanners", " | ".join(parts))
     if ai.status == "ok":
@@ -402,11 +465,12 @@ def render_summary(report: ScanReport, console: Console, sev_filter: str | None 
         table.add_column("Location", style="cyan", no_wrap=True)
         table.add_column("Title", overflow="fold")
         table.add_column("Status", no_wrap=True)
+        table.add_column("How to Access / Example", style="yellow", overflow="fold")
 
         for idx, f in code_rows:
             sev = Text(f.severity.upper(), style=SEV_STYLE.get(f.severity, ""))
             row_style = "dim" if (f.suppressed or f.dismissed) else ""
-            table.add_row(str(idx), sev, f.source_label, f.location, f.title, _status_text(f), style=row_style)
+            table.add_row(str(idx), sev, f.source_label, f.location, f.title, _status_text(f), access_example(f), style=row_style)
         console.print(table)
 
     if dep_rows:
