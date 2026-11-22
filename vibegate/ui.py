@@ -59,7 +59,7 @@ BANNER_LINES = [
 
 BANNER = "\n".join(f"[{style}]{line}[/{style}]" for line, style in BANNER_LINES) + (
     "\n[dim]  Pre-Commit & Repo Security Gate  •  SAST + Secrets + SCA + 2-Layer AI[/dim]"
-    "\n[bold cyan]  by team Z-ZONE[/bold cyan]"
+    ""
 )
 
 
@@ -113,8 +113,10 @@ def threat_impact(finding: Finding) -> str:
         return str(finding.extra["impact"])
     rid = finding.rule_id.lower()
     cat = finding.category
-    if rid in ("web.exposure.dotenv", "web.body.password-over-http"):
-        return "If not fixed, attackers can steal database passwords, API keys, or user login credentials in cleartext."
+    if rid in ("web.exposure.dotenv", "web.body.password-over-http", "web.exposure.backup-sql"):
+        return "If not fixed, attackers can steal database passwords, API keys, full SQL dumps, or user login credentials in cleartext."
+    if rid == "web.body.sql-error-leak":
+        return "If not fixed, attackers learn your database schema from SQL errors and can exploit unparameterized queries via SQL Injection to dump or alter data."
     if rid in ("web.exposure.git-dir", "web.exposure.ds-store", "web.exposure.phpinfo", "web.exposure.openapi"):
         return "If not fixed, attackers can map hidden files/endpoints, read environment details, or reconstruct source code."
     if rid in ("web.body.exposed-secret", "web.bundle.exposed-secret"):
@@ -320,6 +322,9 @@ def _status_text(f: Finding) -> str:
         return "suppressed"
     if f.dismissed:
         return "dismissed"
+    if f.extra.get("check_status"):
+        obs = f.extra.get("observations") or []
+        return f"{f.extra['check_status']} ({len(obs)})" if len(obs) > 1 else str(f.extra["check_status"])
     return STATUS_LABELS.get(f.verification_status, f.verification_status)
 
 
@@ -335,14 +340,40 @@ def _render_detail_panel(idx: int, f: Finding, report: ScanReport, console: Cons
         line_info = f"Lines {f.start_line}-{f.end_line}"
 
     grid = Table.grid(padding=(0, 2))
-    grid.add_column(style="bold", width=10, no_wrap=True)
+    grid.add_column(style="bold", width=13, no_wrap=True)
     grid.add_column()
     grid.add_row("File", f"[cyan]{f.location}[/cyan] ({line_info})   [dim]Rule: {f.rule_id} · {f.source_label}[/dim]")
     grid.add_row("Type", Text(vulnerability_type(f), style="bold yellow"))
+    if f.extra.get("check_status") or f.extra.get("severity_rationale"):
+        status_str = f"{f.extra.get('check_status', _status_text(f))} · Confidence: {f.confidence.upper()}"
+        if f.extra.get("severity_rationale"):
+            status_str += f" — {f.extra['severity_rationale']}"
+        grid.add_row("Assessment", Text(status_str, style="cyan"))
     grid.add_row("Path", Text(full_path, style="dim"))
     grid.add_row("Code", Text(_pinpoint_code(report.target_root, f)))
-    grid.add_row("Issue", Text(f.explanation))
+    if f.extra.get("tested_url") or f.extra.get("observations"):
+        ev_parts = []
+        if f.extra.get("tested_url"):
+            sc = f.extra.get("status_code")
+            m = f.extra.get("method", "GET")
+            ev_parts.append(f"{m} {f.extra['tested_url']}" + (f" (HTTP {sc})" if sc is not None else ""))
+        chain = f.extra.get("redirect_chain") or []
+        if len(chain) > 1:
+            ev_parts.append("Redirects: " + " -> ".join(chain))
+        obs = f.extra.get("observations") or []
+        if len(obs) > 1:
+            urls = ", ".join(f.extra.get("affected_urls") or [])
+            ev_parts.append(f"Observations ({len(obs)}): {urls}")
+        if ev_parts:
+            grid.add_row("Evidence", Text(" | ".join(ev_parts), style="dim"))
+    grid.add_row("Observed", Text(f.extra.get("observed") or f.explanation))
+    if f.extra.get("missing_control"):
+        grid.add_row("Missing", Text(f.extra["missing_control"]))
+    if f.extra.get("likely_cause"):
+        grid.add_row("Likely Cause", Text(f.extra["likely_cause"]))
     grid.add_row("If Unfixed", Text(threat_impact(f), style="red"))
+    if f.extra.get("not_confirmed"):
+        grid.add_row("Not Confirmed", Text(f.extra["not_confirmed"], style="dim"))
     grid.add_row("Access", Text(access_example(f), style="yellow"))
     grid.add_row("Fix", Text(f.remediation, style="green"))
 
@@ -381,35 +412,97 @@ def render_markdown_report(report: ScanReport) -> str:
         lines.append(f"- **Detected Stack:** {', '.join(report.detected_stacks)}")
     lines.append("")
 
+    if report.scanned_version.startswith("web:"):
+        from vibegate.web_audit import compute_web_grade_breakdown
+
+        bd = compute_web_grade_breakdown(report.findings, fail_on=report.policy_fail_on)
+        lines.extend([
+            "## Executive Summary & Score Breakdown",
+            "",
+            f"- **Security Grade:** {bd['grade']} ({bd['score']}/100)",
+            f"- **Scoring Method:** Start at 100; deduct once per unique rule (Critical -30, High -20, Medium -10, Low -4, Info/Hardening 0; duplicates not double-counted).",
+            f"- **Verdict Rule:** {bd['policy_rule']}",
+        ])
+        if bd["deductions"]:
+            lines.append("- **Findings Affecting Score:** " + ", ".join(f"`{d['rule_id']}` (-{d['points']})" for d in bd["deductions"]))
+        lines.append("")
+
     if not active:
-        lines.append("No active vulnerabilities or security risks were detected.")
+        lines.append("No active vulnerabilities or security risks were detected in tested checks.")
         return "\n".join(lines) + "\n"
 
-    lines.extend([
-        "## Findings Summary",
-        "",
-        "| # | Severity | Type | Location | Title | How to Access / Example |",
-        "|---:|---|---|---|---|---|",
-    ])
-    for idx, f in enumerate(active, 1):
-        vtype = vulnerability_type(f).replace("|", "\\|")
-        loc = f.location.replace("|", "\\|")
-        title = f.title.replace("|", "\\|")
-        ex = access_example(f).replace("|", "\\|")
-        lines.append(f"| {idx} | {f.severity.upper()} | {vtype} | `{loc}` | {title} | `{ex}` |")
+    issues = [f for f in active if f.extra.get("finding_kind") != "hardening"]
+    hardening = [f for f in active if f.extra.get("finding_kind") == "hardening"]
+
+    if issues:
+        lines.extend([
+            "## Confirmed Security Findings",
+            "",
+            "| # | Severity | Type | Location | Title | How to Access / Example |",
+            "|---:|---|---|---|---|---|",
+        ])
+        for idx, f in enumerate(issues, 1):
+            vtype = vulnerability_type(f).replace("|", "\\|")
+            loc = f.location.replace("|", "\\|")
+            title = f.title.replace("|", "\\|")
+            ex = access_example(f).replace("|", "\\|")
+            lines.append(f"| {idx} | {f.severity.upper()} | {vtype} | `{loc}` | {title} | `{ex}` |")
+
+    if hardening:
+        lines.extend([
+            "",
+            "## Hardening Opportunities (Informational — 0 Score Impact)",
+            "",
+            "| # | Severity | Location | Recommendation |",
+            "|---:|---|---|---|",
+        ])
+        for idx, f in enumerate(hardening, 1):
+            lines.append(f"| {idx} | {f.severity.upper()} | `{f.location}` | {f.title} |")
 
     lines.extend(["", "## Detailed Findings & Fixes", ""])
     for idx, f in enumerate(active, 1):
+        obs_count = len(f.extra.get("observations") or [])
         lines.extend([
             f"### {idx}. [{f.severity.upper()}] {f.title}",
+            f"- **Status:** {f.extra.get('check_status', _status_text(f))} | **Confidence:** {f.confidence.upper()}" + (f" ({obs_count} observation(s))" if obs_count > 1 else ""),
             f"- **Location:** `{f.location}` (`{f.rule_id}` via {f.source_label})",
             f"- **Type:** {vulnerability_type(f)}",
-            f"- **Issue:** {f.explanation}",
+        ])
+        if f.extra.get("severity_rationale"):
+            lines.append(f"- **Severity & Confidence Rationale:** {f.extra['severity_rationale']}")
+        if f.extra.get("affected_urls"):
+            lines.append(f"- **Affected URL(s):** {', '.join(f'`{u}`' for u in f.extra['affected_urls'])}")
+        lines.extend([
+            f"- **Observed:** {f.extra.get('observed') or f.explanation}",
+            f"- **Missing Control:** {f.extra.get('missing_control', 'See remediation.')}",
+            f"- **Likely Cause:** {f.extra.get('likely_cause', 'The scan confirms this condition but cannot determine its underlying cause.')}",
             f"- **If Unfixed:** {threat_impact(f)}",
+            f"- **Not Confirmed:** {f.extra.get('not_confirmed', 'Backend enforcement and active exploitability were not tested.')}",
             f"- **How to Access / Example:** `{access_example(f)}`",
             f"- **Fix:** {f.remediation}",
             "",
         ])
+
+    for sr in report.scanner_results:
+        if sr.metadata:
+            lines.extend(["## Scan Scope & Coverage", ""])
+            if sr.metadata.get("checks_performed"):
+                lines.append(f"- **Checks Performed:** {', '.join(sr.metadata['checks_performed'])}")
+            if sr.metadata.get("tested_urls"):
+                lines.append(f"- **Tested URLs ({len(sr.metadata['tested_urls'])}):** {', '.join(f'`{u}`' for u in sr.metadata['tested_urls'])}")
+            inc = sr.metadata.get("checks_inconclusive") or []
+            if inc:
+                lines.append("- **Inconclusive / Skipped Checks:**")
+                for item in inc:
+                    lines.append(f"  - `{item.get('check')}` on `{item.get('url')}`: {item.get('status')} ({item.get('error')})")
+            if sr.metadata.get("coverage_limits"):
+                lines.append(f"- **Coverage Limits:** {sr.metadata['coverage_limits']}")
+            lines.append("")
+
+    if report.ai_result.status != "ok":
+        lines.append(f"_AI Analysis Note: AI explanations could not be generated ({report.ai_result.status}: {report.ai_result.message})._\n")
+    else:
+        lines.append("_AI Analysis Note: Any AI-generated commentary is explanatory analysis only, not direct scan evidence._\n")
     return "\n".join(lines)
 
 
@@ -492,22 +585,60 @@ def render_summary(report: ScanReport, console: Console, sev_filter: str | None 
                 )
             )
         else:
-            grade, score = compute_web_grade(report.findings)
+            from vibegate.web_audit import compute_web_grade_breakdown
+
+            bd = compute_web_grade_breakdown(report.findings, fail_on=report.policy_fail_on)
+            grade, score = bd["grade"], bd["score"]
             grade_color = "bold green" if grade in ("A+", "A") else ("bold yellow" if grade in ("B", "C") else "bold red")
-            rids = {f.rule_id for f in report.active_findings}
+            issues_only = [f for f in report.active_findings if f.extra.get("finding_kind") != "hardening"]
+            hardening_only = [f for f in report.active_findings if f.extra.get("finding_kind") == "hardening"]
+            issue_rids = {f.rule_id for f in issues_only}
             checklist = [
-                ("Transport & TLS", any(r.startswith("web.tls.") or r in ("web.http.no-https", "web.header.missing-hsts", "web.body.mixed-content", "web.body.password-over-http") for r in rids)),
-                ("Security Headers", any(r.startswith("web.header.") and r != "web.header.missing-hsts" for r in rids)),
-                ("Cookies & Sessions", any(r.startswith("web.cookie.") for r in rids)),
-                ("CORS Policy", "web.cors.wildcard" in rids),
-                ("Public Exposures", any(r.startswith("web.exposure.") for r in rids)),
-                ("HTML & JS Bundles", any(r in ("web.body.exposed-secret", "web.bundle.exposed-secret", "web.body.debug-leak", "web.body.form-no-csrf", "web.body.missing-sri") for r in rids)),
+                ("Transport & TLS", "tls-handshake, http-redirect, https-connect", any(r.startswith("web.tls.") or r in ("web.http.no-https", "web.header.missing-hsts", "web.body.mixed-content", "web.body.password-over-http") for r in issue_rids)),
+                ("Security Headers", "http-headers (HSTS, CSP, XFO, nosniff, Cache-Control)", any(r.startswith("web.header.") and r != "web.header.missing-hsts" and r in issue_rids for r in issue_rids)),
+                ("Cookies & Sessions", "cookies-cors (Set-Cookie flags)", any(r.startswith("web.cookie.") for r in issue_rids)),
+                ("CORS Policy", "cookies-cors (Access-Control-Allow-Origin)", "web.cors.wildcard" in issue_rids),
+                ("Public Exposures", "exposed-paths (/.env, /.git/HEAD, /.DS_Store, /phpinfo.php, /backup.sql)", any(r.startswith("web.exposure.") for r in issue_rids)),
+                ("HTML & JS Bundles", "html-body, js-bundles (secrets, SQL errors, debug, CSRF, SRI)", any(r in ("web.body.exposed-secret", "web.bundle.exposed-secret", "web.body.sql-error-leak", "web.body.debug-leak", "web.body.form-no-csrf", "web.body.missing-sri") for r in issue_rids)),
             ]
-            chk_lines = [f"Security Grade: [{grade_color}]{grade} ({score}/100)[/{grade_color}]", ""] + [
-                f"{'[red]✗[/red]' if failed else '[green]✓[/green]'} {label}: {'[red]Issues found[/red]' if failed else '[green]PASS[/green]'}"
-                for label, failed in checklist
+            chk_lines = [
+                f"Confirmed Issues: [bold]{len(issues_only)}[/bold]  |  Hardening Advice (0 pts): [cyan]{len(hardening_only)}[/cyan]  |  Security Grade: [{grade_color}]{grade} ({score}/100)[/{grade_color}]",
+                f"[dim]Scoring Rule:[/dim] Start 100; deduct once per unique rule (Crit -30, High -20, Med -10, Low -4, Info/Hardening 0; duplicates not double-counted).",
+                f"[dim]Verdict Rule:[/dim] {bd['policy_rule']}" + (f" -> Blocking: {', '.join(bd['blocking_rules'])}" if bd["blocking_rules"] else " -> No blocking findings"),
             ]
-            console.print(Panel("\n".join(chk_lines), title="[bold cyan]A-to-Z Hosted Site Security Checklist[/bold cyan]", box=box.ROUNDED, border_style="cyan", expand=False))
+            if bd["deductions"]:
+                ded_str = ", ".join(f"{d['rule_id']} (-{d['points']})" for d in bd["deductions"])
+                chk_lines.append(f"[dim]Score Deductions:[/dim] {ded_str}")
+            chk_lines.append("")
+            for label, checks_used, failed in checklist:
+                status_lbl = "[red]Confirmed finding(s)[/red]" if failed else "[green]Not detected in tested checks[/green]"
+                chk_lines.append(f"{'[red]✗[/red]' if failed else '[green]✓[/green]'} {label}: {status_lbl} [dim]({checks_used})[/dim]")
+
+            web_sr = next((sr for sr in report.scanner_results if sr.name == "web-audit" and sr.metadata), None)
+            if web_sr:
+                meta = web_sr.metadata
+                tested = meta.get("tested_urls") or []
+                inc = meta.get("checks_inconclusive") or []
+                hc = meta.get("https_checks") or {}
+                chk_lines.append("")
+                if hc:
+                    chk_lines.append(
+                        f"[dim]HTTPS & Redirect Checks:[/dim] HTTPS={hc.get('https_connect')} | TLS={hc.get('tls_protocol')} | Cert={hc.get('tls_certificate')} | HTTP->HTTPS={hc.get('http_redirect')}"
+                    )
+                chk_lines.append(f"[dim]Tested URLs ({len(tested)}):[/dim] " + ", ".join(tested[:6]) + (" ..." if len(tested) > 6 else ""))
+                if meta.get("not_tested"):
+                    chk_lines.append("[dim]Not Tested:[/dim] " + "; ".join(meta["not_tested"]))
+                if inc:
+                    chk_lines.append(f"[yellow]Inconclusive Checks ({len(inc)}):[/yellow] " + "; ".join(f"{x['check']} ({x['url']}): {x['error']}" for x in inc[:3]))
+                recheck = meta.get("recheck")
+                if recheck and not recheck.get("error"):
+                    chk_lines.append(
+                        f"[bold cyan]Remediation Recheck vs {recheck['baseline_file']}:[/bold cyan] "
+                        f"Fixed={len(recheck['verified_fixed'])} ({', '.join(recheck['verified_fixed']) or 'none'}) | "
+                        f"Still Observed={len(recheck['still_observed'])} | New={len(recheck['new_observed'])}"
+                    )
+                chk_lines.append("[dim]Limitation: Automated passive scanning cannot guarantee discovery of every vulnerability.[/dim]")
+            console.print(Panel("\n".join(chk_lines), title="[bold cyan]Executive Summary & Hosted Site Coverage[/bold cyan]", box=box.ROUNDED, border_style="cyan", expand=False))
 
     if report.ref_summaries:
         ref_table = Table(
@@ -565,27 +696,52 @@ def render_summary(report: ScanReport, console: Console, sev_filter: str | None 
 
     if ai.reasoning_trace:
         topic_labels = {
-            "gemini": "Layer 1 · Gemini\n[dim](Auth & IDOR)[/dim]",
-            "groq": "Layer 2 · Groq\n[dim](2nd Opinion)[/dim]",
-            "judge": "Judge · Gemini\n[dim](Tie-Breaker)[/dim]",
+            "gemini": "Layer 1 · Gemini",
+            "groq": "Layer 2 · Groq",
+            "judge": "Judge · Synthesis",
+            "refined_answer": "Refined Answer\n[dim](With Evidence)[/dim]",
         }
         trace_grid = Table.grid(padding=(0, 2))
-        trace_grid.add_column(style="bold cyan", width=18, no_wrap=True)
+        trace_grid.add_column(style="bold cyan", width=20, no_wrap=True)
         trace_grid.add_column()
-        for layer in ("gemini", "groq", "judge"):
-            q_key = f"{layer}_q"
-            if q_key in ai.reasoning_trace or layer in ai.reasoning_trace:
-                q_txt = ai.reasoning_trace.get(q_key, "")
-                a_txt = ai.reasoning_trace.get(layer, "")
-                cell = Text()
-                if q_txt:
-                    cell.append("Question: ", style="bold yellow")
-                    cell.append(q_txt + "\n")
-                if a_txt:
-                    cell.append("Answer:   ", style="bold green")
-                    cell.append(a_txt)
-                trace_grid.add_row(topic_labels[layer], cell)
-        console.print(Panel(trace_grid, title="AI Reasoning & Two-Key Dialogue", box=box.ROUNDED, border_style="magenta", expand=False))
+        rendered_keys: set[str] = set()
+        if any(k in ai.reasoning_trace for k in ("gemini_q", "groq_q", "judge_q")):
+            for layer in ("gemini", "groq", "judge"):
+                q_key = f"{layer}_q"
+                if q_key in ai.reasoning_trace or layer in ai.reasoning_trace:
+                    rendered_keys.update((layer, q_key))
+                    q_txt = ai.reasoning_trace.get(q_key, "")
+                    a_txt = ai.reasoning_trace.get(layer, "")
+                    cell = Text()
+                    if q_txt:
+                        cell.append("Question: ", style="bold yellow")
+                        cell.append(q_txt + "\n")
+                    if a_txt:
+                        cell.append("Answer:   ", style="bold green")
+                        cell.append(a_txt)
+                    trace_grid.add_row(topic_labels.get(layer, layer), cell)
+        else:
+            if ai.reasoning_trace.get("consensus_q"):
+                trace_grid.add_row("Audit Prompt", Text(ai.reasoning_trace["consensus_q"], style="yellow"))
+                rendered_keys.add("consensus_q")
+            for key, val in ai.reasoning_trace.items():
+                if key in rendered_keys or key in ("judge", "refined_answer", "quarrel", "quarrel_q") or key.endswith("_q"):
+                    continue
+                trace_grid.add_row(topic_labels.get(key, f"Key · {key}"), Text(val))
+            if ai.reasoning_trace.get("quarrel_q") or ai.reasoning_trace.get("quarrel"):
+                q_cell = Text()
+                if ai.reasoning_trace.get("quarrel_q"):
+                    q_cell.append("Challenge: ", style="bold yellow")
+                    q_cell.append(ai.reasoning_trace["quarrel_q"] + "\n")
+                if ai.reasoning_trace.get("quarrel"):
+                    q_cell.append("Rebuttal:  ", style="bold cyan")
+                    q_cell.append(ai.reasoning_trace["quarrel"])
+                trace_grid.add_row("Quarrel / Debate", q_cell)
+            for final_key in ("judge", "refined_answer"):
+                if ai.reasoning_trace.get(final_key):
+                    trace_grid.add_row(topic_labels[final_key], Text(ai.reasoning_trace[final_key], style="bold green"))
+        ai_title = "AI Analysis (Explanation Only — Not Direct Scan Evidence)" if report.scanned_version.startswith("web:") else "AI Reasoning & Two-Key Dialogue"
+        console.print(Panel(trace_grid, title=ai_title, box=box.ROUNDED, border_style="magenta", expand=False))
 
     if not report.findings:
         console.print("[green]No findings reported.[/green]")
@@ -603,8 +759,9 @@ def render_summary(report: ScanReport, console: Console, sev_filter: str | None 
         console.print(f"[cyan]Filter active:[/cyan] showing [bold]{sev_filter.upper()}[/bold] findings ({len(findings_iter)}/{len(report.findings)}).")
 
     if code_rows:
+        table_title = "[bold]Hosted Website Security Threats[/bold]" if report.scanned_version.startswith("web:") else "[bold]Code Security Threats[/bold]"
         table = Table(
-            title="[bold]Code Security Threats[/bold]",
+            title=table_title,
             box=box.ROUNDED,
             style="on #002b5c",
             border_style="bright_cyan",

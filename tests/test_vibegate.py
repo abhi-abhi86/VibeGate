@@ -663,7 +663,9 @@ def test_web_audit_passive_checks_and_cli(monkeypatch):
     from vibegate.web_audit import audit_domain, is_web_target, normalize_web_url
 
     assert is_web_target("example.com") is True
+    assert is_web_target("http://scanme.nmap.org") is True
     assert is_web_target("https://myapp.vercel.app") is True
+    assert is_web_target("https://github.com/owner/repo") is False
     assert is_web_target("https://github.com/owner/repo.git") is False
     assert normalize_web_url("myapp.com") == "https://myapp.com"
     assert normalize_web_url("localhost:8000") == "http://localhost:8000"
@@ -735,7 +737,8 @@ def test_web_audit_passive_checks_and_cli(monkeypatch):
     rendered = buf.getvalue()
     assert "Type" in rendered
     assert "If Unfixed" in rendered
-    assert "A-to-Z Hosted Site Security Checklist" in rendered
+    assert "Executive Summary & Hosted Site Coverage" in rendered
+    assert "Not detected in tested checks" in rendered or "Confirmed finding(s)" in rendered
 
 
 def test_discover_ai_providers_scales_arbitrarily(monkeypatch):
@@ -979,6 +982,436 @@ def test_web_audit_ai_receives_multipage_snapshot_and_guideline(monkeypatch):
     assert captured
     assert "HOSTED WEBSITE AUDIT GUIDELINE" in captured[0]
     assert "/login" in captured[0]
+
+
+def test_web_audit_detects_sql_error_leak_and_backup_dump(monkeypatch):
+    import httpx
+    from vibegate.ui import vulnerability_type
+    from vibegate.web_audit import audit_domain
+
+    class _FakeResp:
+        def __init__(self, url, status_code=200, headers=None, text=""):
+            self.url = url
+            self.status_code = status_code
+            self.headers = httpx.Headers(headers or [])
+            self.text = text
+
+    class _FakeClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def get(self, url, **_kwargs):
+            if url.endswith("/backup.sql"):
+                return _FakeResp(url, 200, text="-- MySQL dump\nCREATE TABLE users (id INT);")
+            if url.endswith(("/.env", "/.git/HEAD", "/.DS_Store", "/phpinfo.php", "/openapi.json")):
+                return _FakeResp(url, 404, text="Not Found")
+            return _FakeResp(
+                "https://shop.example.com/",
+                200,
+                text="Warning: You have an error in your SQL syntax near '' at line 1",
+            )
+
+    monkeypatch.setattr("vibegate.web_audit.httpx.Client", _FakeClient)
+    report = audit_domain("https://shop.example.com", Config(fail_on="high", ai_enabled=False))
+    rids = {f.rule_id for f in report.findings}
+    assert "web.body.sql-error-leak" in rids
+    assert "web.exposure.backup-sql" in rids
+    sql_f = next(f for f in report.findings if f.rule_id == "web.body.sql-error-leak")
+    assert vulnerability_type(sql_f) == "SQL Injection (SQLi)"
+
+
+def test_web_audit_lists_all_vulnerabilities_without_limit_in_table(monkeypatch):
+    import httpx
+    from io import StringIO
+    from rich.console import Console
+    from vibegate.ui import render_summary
+    from vibegate.web_audit import audit_domain
+
+    class _FakeResp:
+        def __init__(self, url, status_code=200, headers=None, text=""):
+            self.url = url
+            self.status_code = status_code
+            self.headers = httpx.Headers(headers or [])
+            self.text = text
+
+    class _FakeClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def get(self, url, **_kwargs):
+            if url.endswith(("/.env", "/.git/HEAD", "/.DS_Store", "/phpinfo.php", "/openapi.json", "/backup.sql")):
+                return _FakeResp(url, 404, text="Not Found")
+            return _FakeResp(
+                "https://app.example.com/",
+                200,
+                text=(
+                    '<form method="post" action="/a"><input name="x"></form>\n'
+                    '<form method="post" action="/b"><input name="y"></form>\n'
+                    '<form method="post" action="/c"><input name="z"></form>\n'
+                ),
+            )
+
+    monkeypatch.setattr("vibegate.web_audit.httpx.Client", _FakeClient)
+    report = audit_domain("https://app.example.com", Config(fail_on="high", ai_enabled=False))
+    csrf_findings = [f for f in report.findings if f.rule_id == "web.body.form-no-csrf"]
+    assert len(csrf_findings) == 1
+    assert len(csrf_findings[0].extra["observations"]) == 3
+    assert csrf_findings[0].extra["check_status"] == "Confirmed"
+    assert csrf_findings[0].extra["status_code"] == 200
+    assert csrf_findings[0].extra["timestamp"]
+    assert csrf_findings[0].extra["severity_rationale"]
+
+    buf = StringIO()
+    render_summary(report, Console(file=buf, width=180))
+    rendered = buf.getvalue()
+    assert "Hosted Website Security Threats" in rendered
+    assert "How to Access / Example" in rendered
+    assert "Confirmed (3)" in rendered
+
+
+def test_web_audit_inconclusive_checks_and_no_ai_invention(monkeypatch):
+    import httpx
+    from vibegate.web_audit import audit_domain
+
+    for k in list(os.environ):
+        if "API_KEY" in k or k.startswith("CUSTOM_AI_"):
+            monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("GEMINI_API_KEY", "secret-key-should-never-leak-12345")
+
+    class _FakeResp:
+        def __init__(self, url, status_code=200, headers=None, text=""):
+            self.url = url
+            self.status_code = status_code
+            self.headers = httpx.Headers(headers or [])
+            self.text = text
+
+    class _FakeClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def get(self, url, **_kwargs):
+            if url.endswith("/admin"):
+                return _FakeResp(url, 403, text="Forbidden")
+            if url.endswith(("/.env", "/.git/HEAD", "/.DS_Store", "/phpinfo.php", "/openapi.json", "/backup.sql")):
+                return _FakeResp(url, 404, text="Not Found")
+            return _FakeResp("https://app.example.com/", 200, text='<a href="/admin">Admin</a>')
+
+    def fake_post(url, **_kwargs):
+        # Even if AI tries to invent a finding, deterministic web-audit findings remain the source of truth
+        inv = {"file": "hosted_site_snapshot.html", "start_line": 1, "end_line": 1, "severity": "critical", "confidence": "high", "title": "Invented RCE", "evidence": "none", "explanation": "guess", "remediation": "none"}
+        return _MockHTTPResponse(_gemini_payload({"is_vulnerable": True, "findings": [inv], "reasoning": "Explained headers."}))
+
+    monkeypatch.setattr("vibegate.web_audit.httpx.Client", _FakeClient)
+    monkeypatch.setattr("httpx.post", fake_post)
+    report = audit_domain("https://app.example.com", Config(ai_enabled=True))
+    assert not any(f.title == "Invented RCE" for f in report.findings)
+    meta = report.scanner_results[0].metadata
+    assert any(x["status"] == "Inconclusive" and "/admin" in x["url"] for x in meta["checks_inconclusive"])
+    assert "cannot guarantee" in meta["coverage_limits"]
+
+
+def test_ai_key_reliability_auth_no_retry_transient_retry_and_no_leak(tmp_path, monkeypatch):
+    import httpx
+    for k in list(os.environ):
+        if "API_KEY" in k or k.startswith("CUSTOM_AI_"):
+            monkeypatch.delenv(k, raising=False)
+
+    secret = "AIzaSySecretKeyDoNotLeak999"
+    monkeypatch.setenv("GEMINI_API_KEY", secret)
+    (tmp_path / "app.py").write_text('@app.route("/api/u")\ndef u(): return "ok"\n')
+    target = ScanTarget(root=str(tmp_path), files=["app.py"], version="staged")
+
+    # 1. Auth error (401) must NOT retry and must NOT leak the key
+    calls = {"n": 0}
+
+    def fake_401(url, **_kwargs):
+        calls["n"] += 1
+        return _MockHTTPResponse({}, status_code=401)
+
+    monkeypatch.setattr("httpx.post", fake_401)
+    res_401 = run_ai_review(target, [], Config(ai_enabled=True, consensus_enabled=False))
+    assert calls["n"] == 1
+    assert res_401.status == "unavailable"
+    assert "authentication failed" in res_401.message
+    assert secret not in res_401.message
+
+    # 2. Transient 503 retries once and succeeds on 2nd attempt
+    calls["n"] = 0
+
+    def fake_503_then_ok(url, **_kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _MockHTTPResponse({}, status_code=503)
+        return _MockHTTPResponse(_gemini_payload({"is_vulnerable": False, "findings": [], "reasoning": "Safe."}))
+
+    monkeypatch.setattr("httpx.post", fake_503_then_ok)
+    res_ok = run_ai_review(target, [], Config(ai_enabled=True, consensus_enabled=False))
+    assert calls["n"] == 2
+    assert res_ok.status == "ok"
+
+    # 3. Malformed JSON response gives clean non-crashing error
+    class _BadJsonResp:
+        status_code = 200
+        def raise_for_status(self):
+            return None
+        def json(self):
+            return {"candidates": [{"content": {"parts": [{"text": "NOT_JSON"}]}}]}
+
+    monkeypatch.setattr("httpx.post", lambda *_a, **_kw: _BadJsonResp())
+    res_bad = run_ai_review(target, [], Config(ai_enabled=True, consensus_enabled=False))
+    assert res_bad.status == "error"
+    assert "malformed provider response" in res_bad.message
+    assert secret not in res_bad.message
+
+
+def test_web_audit_traceable_scoring_hardening_and_recheck(tmp_path, monkeypatch):
+    import httpx
+    from vibegate.web_audit import audit_domain, compute_web_grade_breakdown
+
+    class _FakeResp:
+        def __init__(self, url, status_code=200, headers=None, text="<html>ok</html>"):
+            self.url = url
+            self.status_code = status_code
+            self.headers = httpx.Headers(headers or [])
+            self.text = text
+
+    state = {"fixed": False}
+
+    class _FakeClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def get(self, url, **_kwargs):
+            if url.endswith(("/.env", "/.git/HEAD", "/.DS_Store", "/phpinfo.php", "/openapi.json", "/backup.sql")):
+                return _FakeResp(url, 404, text="Not Found")
+            if state["fixed"]:
+                return _FakeResp(
+                    "https://app.example.com/",
+                    200,
+                    headers=[
+                        ("Strict-Transport-Security", "max-age=31536000"),
+                        ("Content-Security-Policy", "default-src 'self'"),
+                        ("X-Frame-Options", "DENY"),
+                        ("X-Content-Type-Options", "nosniff"),
+                    ],
+                )
+            return _FakeResp("https://app.example.com/", 200, headers=[("Server", "nginx/1.24.0")])
+
+    monkeypatch.setattr("vibegate.web_audit.httpx.Client", _FakeClient)
+    baseline = audit_domain("https://app.example.com", Config(fail_on="high", ai_enabled=False))
+    bd = compute_web_grade_breakdown(baseline.findings, fail_on="high")
+    assert bd["info_penalized"] is False
+    assert bd["duplicates_counted"] is False
+    assert all(d["severity"] != "info" for d in bd["deductions"])
+    meta = baseline.scanner_results[0].metadata
+    assert "http_redirect" in meta["https_checks"]
+    assert "https_connect" in meta["https_checks"]
+
+    baseline_path = tmp_path / "baseline.json"
+    baseline_path.write_text(json.dumps(baseline.to_dict()))
+
+    state["fixed"] = True
+    rechecked = audit_domain("https://app.example.com", Config(fail_on="high", ai_enabled=False), recheck_from=str(baseline_path))
+    recheck_info = rechecked.scanner_results[0].metadata["recheck"]
+    assert "web.header.missing-csp" in recheck_info["verified_fixed"]
+    assert "web.header.missing-hsts" in recheck_info["verified_fixed"]
+    assert "web.header.version-disclosure" in recheck_info["verified_fixed"]
+
+
+def test_web_audit_runs_all_configured_api_keys_simultaneously(monkeypatch):
+    import httpx
+    from vibegate.web_audit import audit_domain
+
+    for k in list(os.environ):
+        if "API_KEY" in k or k.startswith("CUSTOM_AI_"):
+            monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("GEMINI_API_KEY", "gem-key")
+    monkeypatch.setenv("GROQ_API_KEY", "groq-key")
+    monkeypatch.setenv("OPENAI_API_KEY", "oa-key")
+
+    class _FakeResp:
+        def __init__(self, url, status_code=200, headers=None, text="<html>ok</html>"):
+            self.url = url
+            self.status_code = status_code
+            self.headers = httpx.Headers(headers or [])
+            self.text = text
+
+    class _FakeClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def get(self, url, **_kwargs):
+            if url.endswith(("/.env", "/.git/HEAD", "/.DS_Store", "/phpinfo.php", "/openapi.json", "/backup.sql")):
+                return _FakeResp(url, 404, text="Not Found")
+            return _FakeResp("https://app.example.com/", 200, text="<html>ok</html>")
+
+    called = set()
+
+    def fake_post(url, **kwargs):
+        body_txt = json.dumps(kwargs.get("json", {}))
+        if "generativelanguage.googleapis.com" in url:
+            called.add("gemini")
+            return _MockHTTPResponse(_gemini_payload({"is_vulnerable": True, "findings": [], "reasoning": "Gemini report: missing CSP & HSTS."}))
+        if "api.groq.com" in url:
+            called.add("groq")
+            if "ROUND 1 REPORTS" in body_txt:
+                return _MockHTTPResponse(
+                    _groq_payload({
+                        "challenge_question": "Does the missing CSP actually enable XSS without an observed injection sink?",
+                        "is_vulnerable": True,
+                        "findings": [],
+                        "reasoning": "Missing CSP is a defense-in-depth gap, not proof of an XSS sink.",
+                    })
+                )
+            return _MockHTTPResponse(_groq_payload({"is_vulnerable": True, "findings": [], "reasoning": "Groq report: missing XFO & CSP."}))
+        if "api.openai.com" in url:
+            called.add("openai")
+            return _MockHTTPResponse(_groq_payload({"is_vulnerable": True, "findings": [], "reasoning": "OpenAI report: confirmed missing headers."}))
+        raise AssertionError(f"Unexpected URL: {url}")
+
+    monkeypatch.setattr("vibegate.web_audit.httpx.Client", _FakeClient)
+    monkeypatch.setattr("httpx.post", fake_post)
+    report = audit_domain("https://app.example.com", Config(ai_enabled=True))
+    assert report.ai_result.status == "ok"
+    assert called == {"gemini", "groq", "openai"}
+    assert "gemini" in report.ai_result.reasoning_trace
+    assert "groq" in report.ai_result.reasoning_trace
+    assert "openai" in report.ai_result.reasoning_trace
+    assert "quarrel_q" in report.ai_result.reasoning_trace
+    assert "quarrel" in report.ai_result.reasoning_trace
+    assert "refined_answer" in report.ai_result.reasoning_trace
+
+    from io import StringIO
+    from rich.console import Console
+    from vibegate.ui import render_summary
+
+    buf = StringIO()
+    render_summary(report, Console(file=buf, width=160))
+    rendered = buf.getvalue()
+    assert "Key · openai" in rendered
+    assert "Quarrel / Debate" in rendered
+    assert "Does the missing CSP actually enable XSS" in rendered
+    assert "Refined Answer" in rendered
+
+
+def test_web_audit_quarrel_runs_even_when_second_key_returns_401(monkeypatch):
+    import httpx
+    from vibegate.web_audit import audit_domain
+
+    for k in list(os.environ):
+        if "API_KEY" in k or k.startswith("CUSTOM_AI_"):
+            monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("GEMINI_API_KEY", "gem-valid")
+    monkeypatch.setenv("GROQ_API_KEY", "groq-bad")
+
+    class _FakeResp:
+        def __init__(self, url, status_code=200, headers=None, text="<html>ok</html>"):
+            self.url = url
+            self.status_code = status_code
+            self.headers = httpx.Headers(headers or [])
+            self.text = text
+
+    class _FakeClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def get(self, url, **_kwargs):
+            if url.endswith(("/.env", "/.git/HEAD", "/.DS_Store", "/phpinfo.php", "/openapi.json", "/backup.sql")):
+                return _FakeResp(url, 404, text="Not Found")
+            return _FakeResp("http://app.example.com/", 200, text="<html>ok</html>")
+
+    def fake_post(url, **kwargs):
+        body_txt = json.dumps(kwargs.get("json", {}))
+        if "api.groq.com" in url:
+            return _MockHTTPResponse({}, status_code=401)
+        if "ROUND 1 REPORTS" in body_txt:
+            return _MockHTTPResponse(
+                _gemini_payload({
+                    "challenge_question": "Is HTTP-only traffic confirmed without an upstream HTTPS redirect?",
+                    "is_vulnerable": True,
+                    "findings": [],
+                    "reasoning": "Yes, GET http://app.example.com/ returned HTTP 200 with no Location redirect.",
+                })
+            )
+        return _MockHTTPResponse(_gemini_payload({"is_vulnerable": True, "findings": [], "reasoning": "Confirmed unencrypted HTTP."}))
+
+    monkeypatch.setattr("vibegate.web_audit.httpx.Client", _FakeClient)
+    monkeypatch.setattr("httpx.post", fake_post)
+    report = audit_domain("http://app.example.com/", Config(ai_enabled=True))
+    assert "authentication failed (HTTP 401" in report.ai_result.reasoning_trace["groq"]
+    assert "quarrel_q" in report.ai_result.reasoning_trace
+    assert "refined_answer" in report.ai_result.reasoning_trace
+
+
+def test_cli_audit_never_calls_git_clone(monkeypatch):
+    import httpx
+    from vibegate.cli import main as cli_main
+
+    def fail_clone(*_args, **_kwargs):
+        raise AssertionError("git clone must never be called for hosted website audit")
+
+    class _FakeResp:
+        def __init__(self, url, status_code=200, headers=None, text="<html>ok</html>"):
+            self.url = url
+            self.status_code = status_code
+            self.headers = httpx.Headers(headers or [])
+            self.text = text
+
+    class _FakeClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def get(self, url, **_kwargs):
+            if url.endswith(("/.env", "/.git/HEAD", "/.DS_Store", "/phpinfo.php", "/openapi.json", "/backup.sql")):
+                return _FakeResp(url, 404, text="Not Found")
+            return _FakeResp(url, 200, text="<html>ok</html>")
+
+    monkeypatch.setattr("vibegate.git.clone_repo", fail_clone)
+    monkeypatch.setattr("vibegate.web_audit.httpx.Client", _FakeClient)
+    rc = cli_main(["audit", "http://scanme.nmap.org", "--json"])
+    assert rc in (0, 1)
 
 
 def test_several_keys_work_together_across_batches(tmp_path, monkeypatch):

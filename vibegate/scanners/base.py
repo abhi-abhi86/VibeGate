@@ -39,9 +39,10 @@ class ScannerResult:
     message: str = ""
     duration_ms: int = 0
     version: str | None = None
+    metadata: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
-        return {
+        out = {
             "name": self.name,
             "status": self.status,
             "message": self.message,
@@ -49,6 +50,9 @@ class ScannerResult:
             "version": self.version,
             "finding_count": len(self.findings),
         }
+        if self.metadata:
+            out["metadata"] = self.metadata
+        return out
 
 
 class Scanner:

@@ -351,19 +351,81 @@ def _parse_verdict(raw_text: str, valid_files: set[str], scanned_version: str) -
     return is_vuln, findings, reasoning
 
 
+_TRANSIENT_HTTP_CODES = {429, 500, 502, 503, 504}
+
+
+def _sanitize_error_text(msg: str, api_key: str = "") -> str:
+    """Ensure API keys or bearer tokens never leak into error messages or logs."""
+    cleaned = msg
+    if api_key and len(api_key) >= 4:
+        cleaned = cleaned.replace(api_key, "[REDACTED_KEY]")
+    cleaned = re.sub(r"(Bearer\s+)[A-Za-z0-9\-._~+/]+=*", r"\1[REDACTED]", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"(key=)[^&\s]+", r"\1[REDACTED]", cleaned, flags=re.IGNORECASE)
+    return cleaned
+
+
+def _classify_provider_error(exc: Exception, timeout: float, api_key: str = "") -> str:
+    """Return a clear, safe, non-leaking error description for provider failures."""
+    if isinstance(exc, httpx.TimeoutException):
+        return f"timed out after {timeout}s"
+    if isinstance(exc, httpx.HTTPStatusError):
+        code = exc.response.status_code
+        if code in (401, 403):
+            return f"authentication failed (HTTP {code} — check API key)"
+        if code == 429:
+            return "rate limited or quota exceeded (HTTP 429)"
+        if code >= 500:
+            return f"provider outage (HTTP {code})"
+        return f"HTTP {code} (request rejected)"
+    if isinstance(exc, (json.JSONDecodeError, KeyError, IndexError, TypeError, ValueError)):
+        return f"malformed provider response ({type(exc).__name__})"
+    if isinstance(exc, httpx.HTTPError):
+        return f"network error ({_sanitize_error_text(type(exc).__name__, api_key)})"
+    return _sanitize_error_text(f"{type(exc).__name__}: {exc}", api_key)
+
+
+def _post_with_retry(
+    url: str,
+    payload: dict,
+    headers: dict[str, str],
+    timeout: float,
+    api_key: str = "",
+    max_retries: int = 1,
+) -> httpx.Response:
+    """POST to an LLM provider with bounded retry ONLY for transient failures (429/5xx/timeout/connect)."""
+    attempt = 0
+    while True:
+        try:
+            resp = httpx.post(url, json=payload, headers=headers, timeout=timeout)
+            resp.raise_for_status()
+            return resp
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code in _TRANSIENT_HTTP_CODES and attempt < max_retries:
+                attempt += 1
+                time.sleep(0.35 * attempt)
+                continue
+            raise
+        except (httpx.TimeoutException, httpx.ConnectError):
+            if attempt < max_retries:
+                attempt += 1
+                time.sleep(0.35 * attempt)
+                continue
+            raise
+
+
 def _call_gemini(prompt: str, api_key: str, model: str, valid_files: set[str], scanned_version: str, timeout: float) -> tuple[bool, list[Finding], str]:
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": 0.1, "responseMimeType": "application/json"},
     }
-    resp = httpx.post(
+    resp = _post_with_retry(
         url,
-        json=payload,
-        headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
-        timeout=timeout,
+        payload,
+        {"Content-Type": "application/json", "x-goog-api-key": api_key},
+        timeout,
+        api_key=api_key,
     )
-    resp.raise_for_status()
     body = resp.json()
     text = body["candidates"][0]["content"]["parts"][0]["text"]
     return _parse_verdict(text, valid_files, scanned_version)
@@ -387,13 +449,13 @@ def _call_openai_compat(
             {"role": "user", "content": prompt},
         ],
     }
-    resp = httpx.post(
+    resp = _post_with_retry(
         url,
-        json=payload,
-        headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
-        timeout=timeout,
+        payload,
+        {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
+        timeout,
+        api_key=api_key,
     )
-    resp.raise_for_status()
     body = resp.json()
     text = body["choices"][0]["message"]["content"]
     return _parse_verdict(text, valid_files, scanned_version)
@@ -426,20 +488,43 @@ def _call_anthropic(
         "temperature": 0.1,
         "messages": [{"role": "user", "content": prompt}],
     }
-    resp = httpx.post(
+    resp = _post_with_retry(
         url,
-        json=payload,
-        headers={
+        payload,
+        {
             "Content-Type": "application/json",
             "x-api-key": api_key,
             "anthropic-version": "2023-06-01",
         },
-        timeout=timeout,
+        timeout,
+        api_key=api_key,
     )
-    resp.raise_for_status()
     body = resp.json()
     text = body["content"][0]["text"]
     return _parse_verdict(text, valid_files, scanned_version)
+
+
+def _call_provider_raw(prov: AIProvider, prompt: str, timeout: float) -> str:
+    if prov.kind == "gemini":
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{prov.model}:generateContent"
+        payload = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"temperature": 0.2, "responseMimeType": "application/json"}}
+        resp = _post_with_retry(url, payload, {"Content-Type": "application/json", "x-goog-api-key": prov.api_key}, timeout, api_key=prov.api_key)
+        return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+    if prov.kind == "anthropic":
+        payload = {"model": prov.model, "max_tokens": 2048, "temperature": 0.2, "messages": [{"role": "user", "content": prompt}]}
+        resp = _post_with_retry(prov.url, payload, {"Content-Type": "application/json", "x-api-key": prov.api_key, "anthropic-version": "2023-06-01"}, timeout, api_key=prov.api_key)
+        return resp.json()["content"][0]["text"]
+    payload = {
+        "model": prov.model,
+        "temperature": 0.2,
+        "response_format": {"type": "json_object"},
+        "messages": [
+            {"role": "system", "content": "You are an application security reviewer. Output strict JSON only."},
+            {"role": "user", "content": prompt},
+        ],
+    }
+    resp = _post_with_retry(prov.url, payload, {"Content-Type": "application/json", "Authorization": f"Bearer {prov.api_key}"}, timeout, api_key=prov.api_key)
+    return resp.json()["choices"][0]["message"]["content"]
 
 
 def _call_provider(
@@ -459,6 +544,7 @@ def _call_provider(
 def _build_multi_judge_prompt(
     snippets: list[tuple[str, str]],
     verdicts: list[tuple[str, bool, list[Finding], str]],
+    quarrel_note: str = "",
 ) -> str:
     files_block = "\n\n".join(f"=== FILE: {rel} ===\n{body}" for rel, body in snippets)
     opinions = []
@@ -466,13 +552,37 @@ def _build_multi_judge_prompt(
         titles = ", ".join(f"{f.file}:{f.start_line} {f.title}" for f in flist[:6]) or "none"
         opinions.append(f"- {pname}: is_vulnerable={is_v}, findings=[{titles}]\n  reasoning: {reason}")
     opinions_block = "\n".join(opinions)
+    quarrel_block = f"\nCROSS-EXAMINATION / QUARREL:\n{quarrel_note}\n" if quarrel_note else ""
     return (
         "You are the final Consensus Judge synthesizing independent reviews from multiple AI security models.\n"
-        "Review their verdicts and reasoning below, verify against the actual provided code/data, and produce one "
-        "authoritative consensus JSON verdict.\n\n"
-        f"MODEL OPINIONS ({len(verdicts)}):\n{opinions_block}\n\n"
+        "Review their verdicts, reasoning, and cross-examination below, verify against the actual provided evidence, "
+        "and produce one authoritative, evidence-grounded consensus JSON verdict.\n\n"
+        f"MODEL OPINIONS ({len(verdicts)}):\n{opinions_block}\n"
+        f"{quarrel_block}\n"
         "Return ONLY a strict JSON object:\n"
-        '{"is_vulnerable": bool, "findings": [...], "reasoning": "2-3 sentence consensus explanation"}\n\n'
+        '{"is_vulnerable": bool, "findings": [...], "reasoning": "2-3 sentence evidence-grounded refined answer"}\n\n'
+        f"{files_block}"
+    )
+
+
+def _build_quarrel_prompt(
+    snippets: list[tuple[str, str]],
+    verdicts: list[tuple[str, bool, list[Finding], str]],
+) -> str:
+    files_block = "\n\n".join(f"=== FILE: {rel} ===\n{body}" for rel, body in snippets)
+    opinions = "\n".join(
+        f"- {pname} ({'VULNERABLE' if is_v else 'SAFE'}, {len(flist)} finding(s)): {reason}"
+        for pname, is_v, flist, reason in verdicts
+    )
+    return (
+        "You are an adversarial peer reviewer cross-examining the other AI models' findings below.\n"
+        "Do NOT repeat a generic checklist. Pick the sharpest disagreement, weak assumption, or unverified claim "
+        "in the other models' reasoning, formulate a specific challenge question (`challenge_question`) against them, "
+        "and state your rebuttal (`reasoning`) strictly grounded in the observed evidence.\n\n"
+        f"ROUND 1 REPORTS:\n{opinions}\n\n"
+        "Return ONLY a strict JSON object:\n"
+        '{"challenge_question": "specific question challenging another model claim", '
+        '"is_vulnerable": bool, "findings": [...], "reasoning": "evidence-backed rebuttal"}\n\n'
         f"{files_block}"
     )
 
@@ -504,6 +614,7 @@ def _run_n_provider_consensus(
     stack_guidance: str,
     emit,
     start: float,
+    always_refine: bool = False,
 ) -> AIReviewResult:
     """Run all N configured API keys/providers concurrently and synthesize a consensus verdict."""
     valid_files = {rel for rel, _ in snippets}
@@ -546,34 +657,61 @@ def _run_n_provider_consensus(
     ms = int((time.monotonic() - start) * 1000)
 
     # Unanimous Safe
-    if not vuln_votes:
+    if not vuln_votes and not (always_refine and total_ok >= 1):
         status = f"{total_ok}/{total_ok}_safe" if total_ok >= 2 else "single"
         return AIReviewResult("ok", [], f"{total_ok}/{len(providers)} AI key(s) agreed: Safe", ms, status, trace)
 
     # Unanimous Vulnerable (or single provider) -> merge findings
-    if not safe_votes:
+    if not safe_votes and not (always_refine and total_ok >= 1):
         merged = _deduplicate_findings([f for _, _, flist, _ in vuln_votes for f in flist])
         status = f"{total_ok}/{total_ok}_vulnerable" if total_ok >= 2 else "single"
         _attach_consensus(merged, status, trace)
         return AIReviewResult("ok", merged, f"{total_ok}/{len(providers)} AI key(s) found {len(merged)} issue(s)", ms, status, trace)
 
-    # Disagreement among N providers -> Synthesis Judge using the first responding provider
+    # Disagreement among N providers (or always_refine for hosted web) -> Cross-Examination Quarrel + Refined Synthesis
+    quarrel_note = ""
+    if always_refine and total_ok >= 1:
+        challenger = verdicts[1][0] if total_ok >= 2 else verdicts[0][0]
+        q_prompt = _build_quarrel_prompt(
+            snippets,
+            [(p.name, is_v, flist, reason) for p, is_v, flist, reason in verdicts],
+        )
+        mode_lbl = "Cross-Examination" if total_ok >= 2 else "Adversarial Self-Check"
+        emit("ai_start", f"{mode_lbl} ({challenger.name}) challenging Round 1 report(s)...")
+        try:
+            q_raw = _call_provider_raw(challenger, q_prompt, per_call_timeout)
+            q_data = json.loads(re.sub(r"^```(?:json)?\s*|\s*```$", "", q_raw.strip(), flags=re.DOTALL))
+            c_question = str(q_data.get("challenge_question") or "").strip()
+            c_rebuttal = str(q_data.get("reasoning") or "").strip()
+            if c_question:
+                who = f"{challenger.name} challenges peers" if total_ok >= 2 else f"{challenger.name} self-challenge"
+                trace["quarrel_q"] = f"{who}: {c_question}"
+            if c_rebuttal:
+                trace["quarrel"] = c_rebuttal
+            quarrel_note = f"{trace.get('quarrel_q', '')}\nRebuttal: {c_rebuttal}".strip()
+        except Exception as q_exc:
+            trace["quarrel"] = f"cross-examination skipped ({_classify_provider_error(q_exc, per_call_timeout, challenger.api_key)})"
+
     judge_prov = verdicts[0][0]
     judge_prompt = _build_multi_judge_prompt(
         snippets,
         [(p.name, is_v, flist, reason) for p, is_v, flist, reason in verdicts],
+        quarrel_note=quarrel_note,
     )
-    emit("ai_start", f"Consensus Judge ({judge_prov.name}) synthesizing {total_ok} opinions for {files_list}...")
+    emit("ai_start", f"Refined Synthesis ({judge_prov.name}) combining {total_ok} individual reports for {files_list}...")
     try:
         j_vuln, j_findings, j_reason = _call_provider(judge_prov, judge_prompt, valid_files, scanned_version, per_call_timeout)
-        trace["judge"] = j_reason
+        if always_refine:
+            trace["refined_answer"] = j_reason
+        else:
+            trace["judge"] = j_reason
         final_findings = j_findings if j_vuln else []
         _attach_consensus(final_findings, "debate_resolved", trace)
         ms = int((time.monotonic() - start) * 1000)
         return AIReviewResult(
             "ok",
             final_findings,
-            f"Consensus Judge ({judge_prov.name}) synthesized {total_ok} AI opinions",
+            f"Refined synthesis ({judge_prov.name}) combined {total_ok} individual AI reports",
             ms,
             "debate_resolved",
             trace,
@@ -595,12 +733,8 @@ def _safe_call_provider(
 ):
     try:
         return prov, _call_provider(prov, prompt, valid_files, scanned_version, timeout)
-    except httpx.TimeoutException:
-        return prov, f"timed out after {timeout}s"
-    except httpx.HTTPStatusError as exc:
-        return prov, f"HTTP {exc.response.status_code}"
     except Exception as exc:
-        return prov, f"{type(exc).__name__}: {exc}"
+        return prov, _classify_provider_error(exc, timeout, prov.api_key)
 
 
 def _review_batch(
@@ -650,12 +784,10 @@ def _review_batch(
             return AIReviewResult("ok", findings, f"reviewed {len(snippets)} file(s) with {cfg.ai_model}", ms, "single", trace)
         except httpx.TimeoutException:
             return AIReviewResult("timeout", [], f"AI review timed out after {per_call_timeout}s", int((time.monotonic() - start) * 1000))
-        except httpx.HTTPStatusError as exc:
-            return AIReviewResult("unavailable", [], f"AI review HTTP {exc.response.status_code}; deterministic results shown", int((time.monotonic() - start) * 1000))
-        except httpx.HTTPError as exc:
-            return AIReviewResult("unavailable", [], f"AI review unavailable ({exc}); deterministic results shown", int((time.monotonic() - start) * 1000))
         except Exception as exc:
-            return AIReviewResult("error", [], f"AI review failed ({type(exc).__name__}: {exc}); deterministic results shown", int((time.monotonic() - start) * 1000))
+            err_msg = _classify_provider_error(exc, per_call_timeout, gemini_key)
+            st = "unavailable" if isinstance(exc, httpx.HTTPError) else "error"
+            return AIReviewResult(st, [], f"AI review {err_msg}; deterministic results shown", int((time.monotonic() - start) * 1000))
 
     # 2-Layer Gated Consensus:
     # 1) Run Layer 1 (Gemini). If Gemini finds vulnerabilities, return immediately without calling Groq.
@@ -665,14 +797,8 @@ def _review_batch(
     g_err = None
     try:
         g_verdict = _call_gemini(prompt, gemini_key, cfg.ai_model, valid_files, scanned_version, per_call_timeout)
-    except httpx.TimeoutException:
-        g_err = f"timed out after {per_call_timeout}s"
-    except httpx.HTTPStatusError as exc:
-        g_err = f"HTTP {exc.response.status_code}"
-    except httpx.HTTPError as exc:
-        g_err = f"unavailable ({exc})"
     except Exception as exc:
-        g_err = f"{type(exc).__name__}: {exc}"
+        g_err = _classify_provider_error(exc, per_call_timeout, gemini_key)
 
     if g_verdict is None:
         # Layer 1 (Gemini) failed -> fall back to Layer 2 (Groq) instead of skipping AI reasoning
@@ -687,7 +813,7 @@ def _review_batch(
             return AIReviewResult("ok", final_findings, f"Gemini unavailable ({g_err}); used Groq ({cfg.groq_model})", ms, "single_fallback", trace)
         except Exception as q_exc:
             ms = int((time.monotonic() - start) * 1000)
-            q_err = f"HTTP {q_exc.response.status_code}" if isinstance(q_exc, httpx.HTTPStatusError) else f"{type(q_exc).__name__}: {q_exc}"
+            q_err = _classify_provider_error(q_exc, per_call_timeout, groq_key)
             return AIReviewResult("unavailable", [], f"Gemini ({g_err}) and Groq ({q_err}) unavailable; deterministic results shown", ms)
 
     g_vuln, g_findings, g_reason = g_verdict
@@ -745,6 +871,7 @@ def run_ai_review(
     cfg: Config,
     progress_cb=None,
     stack_guidance: str = "",
+    parallel_all: bool = False,
 ) -> AIReviewResult:
     def emit(event: str, msg: str) -> None:
         if progress_cb:
@@ -766,6 +893,10 @@ def run_ai_review(
     use_consensus = cfg.consensus_enabled or len(providers) >= 2
 
     if len(batches) == 1:
+        if parallel_all:
+            return _run_n_provider_consensus(
+                providers, batches[0], target.version, cfg, per_call_timeout, stack_guidance, emit, start, always_refine=True
+            )
         return _review_batch(
             batches[0],
             target.version,
