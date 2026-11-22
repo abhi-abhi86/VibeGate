@@ -63,12 +63,76 @@ BANNER = "\n".join(f"[{style}]{line}[/{style}]" for line, style in BANNER_LINES)
 )
 
 
+def vulnerability_type(finding: Finding) -> str:
+    """Classify the concrete vulnerability type strictly from the observed rule/category/title."""
+    rid = finding.rule_id.lower()
+    title = finding.title.lower()
+    text = f"{rid} {title}"
+    cat = finding.category
+
+    if cat == "dependency":
+        return "Vulnerable Dependency (Known CVE)"
+    if "sql" in text or "rawsql" in text or "raw-sql" in text:
+        return "SQL Injection (SQLi)"
+    if any(k in text for k in ("ssti", "render_template_string")):
+        return "Server-Side Template Injection (SSTI)"
+    if any(k in text for k in ("xss", "cross-site scripting", "innerhtml", "document.write")):
+        return "Cross-Site Scripting (XSS)"
+    if any(k in text for k in ("subprocess", "os-system", "command", "pickle", "yaml", "deserializ", "eval", "exec")):
+        return "Command / Code Injection (RCE)"
+    if "traversal" in text:
+        return "Path Traversal / Arbitrary File Read"
+    if "ssrf" in text:
+        return "Server-Side Request Forgery (SSRF)"
+    if cat == "secret" or any(k in text for k in ("exposed-secret", "dotenv", "hardcoded-flask-secret")):
+        return "Exposed Secret / Credential Leak"
+    if "csrf" in text:
+        return "Cross-Site Request Forgery (CSRF)"
+    if "missing-xfo" in rid or "clickjacking" in text:
+        return "Clickjacking (UI Redressing)"
+    if "cors" in text:
+        return "Cross-Origin Data Exposure (CORS Misconfiguration)"
+    if "cookie" in text:
+        return "Session Cookie Misconfiguration"
+    if any(k in text for k in ("tls", "no-https", "hsts", "mixed-content")):
+        return "Transport Security / Man-in-the-Middle (MitM) Risk"
+    if any(k in text for k in ("weak-hash", "md5", "sha1")):
+        return "Weak Cryptography / Password Hashing"
+    if any(k in text for k in ("debug", "version-disclosure", "git-dir")):
+        return "Sensitive Information / Debug Disclosure"
+    if cat == "access_control" or any(k in text for k in ("idor", "auth", "login")):
+        return "Broken Access Control / IDOR"
+    if cat == "bug":
+        return "Code Logic / Reliability Bug"
+    return "Security Misconfiguration"
+
+
 def threat_impact(finding: Finding) -> str:
-    """Return a plain-English explanation of what real-world threat/attack this vulnerability enables."""
+    """Return a plain-English explanation of what will happen if this observed vulnerability is not fixed."""
     if finding.extra.get("impact"):
         return str(finding.extra["impact"])
     rid = finding.rule_id.lower()
     cat = finding.category
+    if rid in ("web.exposure.dotenv", "web.body.password-over-http"):
+        return "If not fixed, attackers can steal database passwords, API keys, or user login credentials in cleartext."
+    if rid in ("web.exposure.git-dir", "web.exposure.ds-store", "web.exposure.phpinfo", "web.exposure.openapi"):
+        return "If not fixed, attackers can map hidden files/endpoints, read environment details, or reconstruct source code."
+    if rid in ("web.body.exposed-secret", "web.bundle.exposed-secret"):
+        return "If not fixed, any visitor can extract this key from page source or JS bundles and abuse your API quota or backend data."
+    if rid in ("web.http.no-https", "web.header.missing-hsts", "web.body.mixed-content") or "tls" in rid:
+        return "If not fixed, attackers on the same network can intercept or tamper with traffic via a Man-in-the-Middle (MitM) attack."
+    if rid in ("web.header.missing-csp", "web.header.weak-csp"):
+        return "If not fixed, any XSS bug on the page can load external attacker scripts and exfiltrate user data."
+    if rid == "web.header.missing-xfo":
+        return "If not fixed, attackers can embed your site in a hidden iframe (Clickjacking) to trick users into unintended actions."
+    if rid == "web.cookie.missing-flags":
+        return "If not fixed, session cookies may be stolen via XSS (missing HttpOnly), leaked over HTTP (missing Secure), or abused via CSRF (missing SameSite)."
+    if rid == "web.cors.wildcard":
+        return "If not fixed, untrusted third-party websites can read responses from this endpoint inside a user's browser."
+    if rid == "web.body.form-no-csrf":
+        return "If not fixed, external sites can forge POST requests using a logged-in user's browser session (CSRF)."
+    if rid in ("web.body.debug-leak", "web.header.version-disclosure"):
+        return "If not fixed, attackers gain internal stack traces or exact software versions to target known CVEs."
     if cat == "secret":
         return (
             "Anyone with access to the repo or Git history can extract this credential to "
@@ -274,10 +338,12 @@ def _render_detail_panel(idx: int, f: Finding, report: ScanReport, console: Cons
     grid.add_column(style="bold", width=10, no_wrap=True)
     grid.add_column()
     grid.add_row("File", f"[cyan]{f.location}[/cyan] ({line_info})   [dim]Rule: {f.rule_id} · {f.source_label}[/dim]")
+    grid.add_row("Type", Text(vulnerability_type(f), style="bold yellow"))
     grid.add_row("Path", Text(full_path, style="dim"))
     grid.add_row("Code", Text(_pinpoint_code(report.target_root, f)))
     grid.add_row("Issue", Text(f.explanation))
-    grid.add_row("Threat", Text(threat_impact(f), style="red"))
+    grid.add_row("If Unfixed", Text(threat_impact(f), style="red"))
+    grid.add_row("Access", Text(access_example(f), style="yellow"))
     grid.add_row("Fix", Text(f.remediation, style="green"))
 
     console.print(
@@ -300,11 +366,64 @@ CONSENSUS_BADGES = {
 }
 
 
+def render_markdown_report(report: ScanReport) -> str:
+    """Render a shareable Markdown security report (suitable for PRs or post-deploy audits)."""
+    active = report.active_findings
+    status_line = "BLOCKED" if report.policy_blocked else "PASS"
+    lines = [
+        "# VibeGate Security Report",
+        "",
+        f"- **Target:** `{report.target_root}` (`{report.scanned_version}`)",
+        f"- **Scorecard:** **{len(active)} active risk(s)** — **{status_line}** (threshold: `{report.policy_fail_on}`)",
+        f"- **Duration:** {report.duration_ms / 1000:.2f}s",
+    ]
+    if report.detected_stacks:
+        lines.append(f"- **Detected Stack:** {', '.join(report.detected_stacks)}")
+    lines.append("")
+
+    if not active:
+        lines.append("No active vulnerabilities or security risks were detected.")
+        return "\n".join(lines) + "\n"
+
+    lines.extend([
+        "## Findings Summary",
+        "",
+        "| # | Severity | Type | Location | Title | How to Access / Example |",
+        "|---:|---|---|---|---|---|",
+    ])
+    for idx, f in enumerate(active, 1):
+        vtype = vulnerability_type(f).replace("|", "\\|")
+        loc = f.location.replace("|", "\\|")
+        title = f.title.replace("|", "\\|")
+        ex = access_example(f).replace("|", "\\|")
+        lines.append(f"| {idx} | {f.severity.upper()} | {vtype} | `{loc}` | {title} | `{ex}` |")
+
+    lines.extend(["", "## Detailed Findings & Fixes", ""])
+    for idx, f in enumerate(active, 1):
+        lines.extend([
+            f"### {idx}. [{f.severity.upper()}] {f.title}",
+            f"- **Location:** `{f.location}` (`{f.rule_id}` via {f.source_label})",
+            f"- **Type:** {vulnerability_type(f)}",
+            f"- **Issue:** {f.explanation}",
+            f"- **If Unfixed:** {threat_impact(f)}",
+            f"- **How to Access / Example:** `{access_example(f)}`",
+            f"- **Fix:** {f.remediation}",
+            "",
+        ])
+    return "\n".join(lines)
+
+
 def render_summary(report: ScanReport, console: Console, sev_filter: str | None = None, show_reasoning: bool = False) -> None:
     console.print()
     active_count = len(report.active_findings)
     crit_high = sum(1 for f in report.active_findings if f.severity in ("critical", "high"))
-    if report.policy_blocked:
+    web_failed = report.scanned_version.startswith("web:") and any(
+        sr.name == "web-audit" and sr.status == "error" for sr in report.scanner_results
+    )
+    if web_failed:
+        score_text = "[bold red]UNREACHABLE — AUDIT FAILED[/bold red]"
+        border = "red"
+    elif report.policy_blocked:
         score_text = f"[bold red]{active_count} Risk(s) ({crit_high} Critical/High) — BLOCKED[/bold red]"
         border = "red"
     elif active_count > 0:
@@ -325,11 +444,12 @@ def render_summary(report: ScanReport, console: Console, sev_filter: str | None 
     summary_grid = Table.grid(padding=(0, 2))
     summary_grid.add_column(style="bold", width=11, no_wrap=True)
     summary_grid.add_column()
-    target_label = (
-        f"1 file ({os.path.basename(report.scanned_version[5:])})"
-        if report.scanned_version.startswith("file:")
-        else f"{len(report.files_scanned)} {report.scanned_version} file(s)"
-    )
+    if report.scanned_version.startswith("web:"):
+        target_label = f"live domain ({report.scanned_version[4:]})"
+    elif report.scanned_version.startswith("file:"):
+        target_label = f"1 file ({os.path.basename(report.scanned_version[5:])})"
+    else:
+        target_label = f"{len(report.files_scanned)} {report.scanned_version} file(s)"
     summary_grid.add_row(
         "Target",
         f"{target_label} scanned in [bold cyan]{report.duration_ms / 1000:.2f}s[/bold cyan]",
@@ -356,6 +476,38 @@ def render_summary(report: ScanReport, console: Console, sev_filter: str | None 
         summary_grid.add_row("Threats", sev_bar)
 
     console.print(Panel(summary_grid, title="[bold magenta]VibeGate Report[/bold magenta]", box=box.ROUNDED, border_style=border, expand=False))
+
+    if report.scanned_version.startswith("web:"):
+        from vibegate.web_audit import compute_web_grade
+
+        if web_failed:
+            console.print(
+                Panel(
+                    "[bold red]Security Grade: N/A (Site Unreachable)[/bold red]\n\n"
+                    "Could not connect to the target URL over HTTPS or HTTP; no security checks could be completed.",
+                    title="[bold red]A-to-Z Hosted Site Security Checklist[/bold red]",
+                    box=box.ROUNDED,
+                    border_style="red",
+                    expand=False,
+                )
+            )
+        else:
+            grade, score = compute_web_grade(report.findings)
+            grade_color = "bold green" if grade in ("A+", "A") else ("bold yellow" if grade in ("B", "C") else "bold red")
+            rids = {f.rule_id for f in report.active_findings}
+            checklist = [
+                ("Transport & TLS", any(r.startswith("web.tls.") or r in ("web.http.no-https", "web.header.missing-hsts", "web.body.mixed-content", "web.body.password-over-http") for r in rids)),
+                ("Security Headers", any(r.startswith("web.header.") and r != "web.header.missing-hsts" for r in rids)),
+                ("Cookies & Sessions", any(r.startswith("web.cookie.") for r in rids)),
+                ("CORS Policy", "web.cors.wildcard" in rids),
+                ("Public Exposures", any(r.startswith("web.exposure.") for r in rids)),
+                ("HTML & JS Bundles", any(r in ("web.body.exposed-secret", "web.bundle.exposed-secret", "web.body.debug-leak", "web.body.form-no-csrf", "web.body.missing-sri") for r in rids)),
+            ]
+            chk_lines = [f"Security Grade: [{grade_color}]{grade} ({score}/100)[/{grade_color}]", ""] + [
+                f"{'[red]✗[/red]' if failed else '[green]✓[/green]'} {label}: {'[red]Issues found[/red]' if failed else '[green]PASS[/green]'}"
+                for label, failed in checklist
+            ]
+            console.print(Panel("\n".join(chk_lines), title="[bold cyan]A-to-Z Hosted Site Security Checklist[/bold cyan]", box=box.ROUNDED, border_style="cyan", expand=False))
 
     if report.ref_summaries:
         ref_table = Table(
@@ -386,7 +538,7 @@ def render_summary(report: ScanReport, console: Console, sev_filter: str | None 
     if ai.status not in ("ok", "skipped") and ai.message:
         console.print(f"[yellow]AI review note:[/yellow] {ai.message}")
 
-    if not report.policy_blocked:
+    if not report.policy_blocked and not web_failed:
         reasons_ok: list[str] = [
             f"Scanned {len(report.files_scanned)} file(s) with policy threshold >= '{report.policy_fail_on}'."
         ]

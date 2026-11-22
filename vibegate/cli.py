@@ -13,13 +13,14 @@ from rich.console import Console
 
 from vibegate import __version__, git
 from vibegate.config import CONFIG_FILE, DEFAULT_TOML, load_config
-from vibegate.engine import scan_push, scan_remote_repo, scan_staged, scan_working_tree
+from vibegate.engine import report_to_sarif, scan_push, scan_remote_repo, scan_staged, scan_working_tree
 from vibegate.models import SEVERITIES
 from vibegate.scanners import ALL_SCANNERS
 from vibegate.scanners.semgrep import RULES_PATH
 from vibegate.patcher import apply_all_safe_fixes
 from vibegate.suppress import SUPPRESS_FILE, load_suppressions
-from vibegate.ui import LiveScanDisplay, print_banner, render_summary, run_interactive
+from vibegate.ui import LiveScanDisplay, print_banner, render_markdown_report, render_summary, run_interactive
+from vibegate.web_audit import audit_domain, is_web_target
 
 HOOK_MARKER = "# vibegate-managed-hook"
 PRE_COMMIT_SCRIPT = f"""#!/usr/bin/env sh
@@ -47,6 +48,12 @@ def _run_scan(args: argparse.Namespace, progress_cb) -> "ScanReport | int":
         except git.GitError as exc:
             print(f"Error: {exc}", file=sys.stderr)
             return 2, cfg
+
+    if is_web_target(target):
+        cfg = load_config(None)
+        if args.fail_on:
+            cfg.fail_on = args.fail_on
+        return audit_domain(target, cfg, progress_cb=progress_cb), cfg
 
     cwd = os.path.abspath(target)
     if not os.path.exists(cwd):
@@ -119,6 +126,15 @@ def cmd_scan(args: argparse.Namespace) -> int:
             json.dump(report.to_dict(), fh, indent=2)
             fh.write("\n")
         console.print(f"[dim]Saved JSON report to {args.output}[/dim]")
+    if getattr(args, "report_md", None):
+        with open(args.report_md, "w", encoding="utf-8") as fh:
+            fh.write(render_markdown_report(report))
+        console.print(f"[dim]Saved Markdown report to {args.report_md}[/dim]")
+    if getattr(args, "sarif", None):
+        with open(args.sarif, "w", encoding="utf-8") as fh:
+            json.dump(report_to_sarif(report), fh, indent=2)
+            fh.write("\n")
+        console.print(f"[dim]Saved SARIF report to {args.sarif}[/dim]")
     if args.ci or args.no_tui:
         render_summary(report, console, show_reasoning=args.show_reasoning)
         if report.policy_blocked:
@@ -364,6 +380,8 @@ def build_parser() -> argparse.ArgumentParser:
     scan.add_argument("--deps", action="store_true", help="Also scan dependency manifests/lockfiles with OSV-Scanner")
     scan.add_argument("--auto-fix", action="store_true", help="Apply all available safe fixes and re-stage")
     scan.add_argument("--output", "-o", help="Save JSON scan report to a file")
+    scan.add_argument("--report-md", help="Save human-readable Markdown security report to a file")
+    scan.add_argument("--sarif", help="Save SARIF 2.1.0 report for GitHub Code Scanning / CI")
     scan.add_argument("--fail-on", choices=SEVERITIES, help="Override blocking severity threshold")
     scan.set_defaults(func=cmd_scan)
 
@@ -388,6 +406,39 @@ def build_parser() -> argparse.ArgumentParser:
     sups = sub.add_parser("suppressions", help="List or clear .vibegate-ignore.json suppressions")
     sups.add_argument("sup_action", nargs="?", choices=["list", "clear"], default="list")
     sups.set_defaults(func=cmd_suppressions)
+
+    audit = sub.add_parser("audit", help="Run a passive HTTP/TLS security posture audit on a hosted domain or URL")
+    audit.add_argument("target", help="Domain or URL you own/are authorized to audit (e.g. https://myapp.com)")
+    audit.add_argument("--ci", action="store_true", help="Non-interactive mode for CI")
+    audit.add_argument("--json", action="store_true", help="Emit machine-readable JSON report")
+    audit.add_argument("--no-tui", action="store_true", help="Print summary without interactive prompt")
+    audit.add_argument("--output", "-o", help="Save JSON audit report to a file")
+    audit.add_argument("--report-md", help="Save human-readable Markdown security report to a file")
+    audit.add_argument("--sarif", help="Save SARIF 2.1.0 report for GitHub Code Scanning / CI")
+    audit.add_argument("--fail-on", choices=SEVERITIES, help="Override blocking severity threshold")
+    audit.set_defaults(
+        func=lambda a: cmd_scan(
+            argparse.Namespace(
+                path=a.target,
+                repo=None,
+                branch=None,
+                staged=False,
+                push=False,
+                all=True,
+                ci=a.ci,
+                json=a.json,
+                no_tui=a.no_tui,
+                no_ai=True,
+                show_reasoning=False,
+                deps=False,
+                auto_fix=False,
+                output=a.output,
+                report_md=a.report_md,
+                sarif=a.sarif,
+                fail_on=a.fail_on,
+            )
+        )
+    )
     return p
 
 

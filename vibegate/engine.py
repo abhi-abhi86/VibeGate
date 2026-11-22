@@ -358,3 +358,58 @@ def scan_push(
         target = ScanTarget(root=td, files=files, version=f"push ({target_sha[:7]})")
         return _run_on_target(target, repo_root, [], cfg, start, progress_cb=progress_cb)
 
+
+def report_to_sarif(report: ScanReport) -> dict:
+    """Export active findings in SARIF 2.1.0 format for GitHub Code Scanning / CI."""
+    sev_to_sarif = {
+        "critical": "error",
+        "high": "error",
+        "medium": "warning",
+        "low": "note",
+        "info": "note",
+    }
+    rules: dict[str, dict] = {}
+    results: list[dict] = []
+    for f in report.active_findings:
+        if f.rule_id not in rules:
+            rules[f.rule_id] = {
+                "id": f.rule_id,
+                "name": f.title,
+                "shortDescription": {"text": f.title},
+                "help": {"text": f.remediation},
+            }
+        results.append(
+            {
+                "ruleId": f.rule_id,
+                "level": sev_to_sarif.get(f.severity, "warning"),
+                "message": {"text": f"{f.title}: {f.explanation} Fix: {f.remediation}"},
+                "locations": [
+                    {
+                        "physicalLocation": {
+                            "artifactLocation": {"uri": f.file},
+                            "region": {
+                                "startLine": max(1, f.start_line or 1),
+                                "endLine": max(1, f.end_line or f.start_line or 1),
+                            },
+                        }
+                    }
+                ],
+            }
+        )
+    return {
+        "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/Schemata/sarif-schema-2.1.0.json",
+        "version": "2.1.0",
+        "runs": [
+            {
+                "tool": {
+                    "driver": {
+                        "name": "VibeGate",
+                        "version": "0.1.0",
+                        "rules": list(rules.values()),
+                    }
+                },
+                "results": results,
+            }
+        ],
+    }
+

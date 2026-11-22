@@ -46,7 +46,7 @@ if [ "$#" -gt 0 ]; then
       run_live_demo
       exit 0
       ;;
-    scan|hook|init|doctor|rules|suppressions|-h|--help|--version)
+    scan|hook|init|doctor|rules|suppressions|audit|-h|--help|--version)
       exec "$VIBEGATE_BIN" "$@"
       ;;
     *)
@@ -70,8 +70,9 @@ echo "  2) Local project folder / downloaded directory"
 echo "  3) Single local file path (e.g. an unuploaded file on your system)"
 echo "  4) Activate automatic Git commit & push protection (all repos, no path needed)"
 echo "  5) Deactivate automatic Git commit & push protection"
+echo "  6) Hosted domain / live URL security audit (HTTPS, headers, cookies, CORS, exposures)"
 echo ""
-printf "Choose [1-5] or paste a Git URL / path: "
+printf "Choose [1-6] or paste a Git URL / domain / path: "
 IFS= read -r CHOICE
 CHOICE="$(printf '%s' "$CHOICE" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
 case "$CHOICE" in
@@ -92,6 +93,11 @@ case "$CHOICE" in
     ;;
   5)
     exec "$VIBEGATE_BIN" hook uninstall --global
+    ;;
+  6)
+    printf "Enter domain or URL you own/are authorized to audit (e.g. https://myapp.com): "
+    IFS= read -r TARGET
+    exec "$VIBEGATE_BIN" audit "$TARGET"
     ;;
   *)
     TARGET="$CHOICE"

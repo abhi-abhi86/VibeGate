@@ -29,8 +29,99 @@ SECRET_LINE_HINTS = re.compile(
     r"(?:API_KEY|SECRET_KEY|TOKEN|PASSWORD|PRIVATE_KEY)\s*=\s*['\"][^'\"]{10,}['\"])"
 )
 
-CODE_EXTENSIONS = {".py", ".js", ".ts", ".jsx", ".tsx", ".go", ".rb", ".java", ".php", ".cs", ".sql", ".sh", ".yml", ".yaml"}
+CODE_EXTENSIONS = {".py", ".js", ".ts", ".jsx", ".tsx", ".go", ".rb", ".java", ".php", ".cs", ".sql", ".sh", ".yml", ".yaml", ".html"}
 LLM_CALL_TIMEOUT = 15.0
+
+
+@dataclass
+class AIProvider:
+    name: str
+    kind: str  # gemini | openai_compat | anthropic
+    api_key: str
+    model: str
+    url: str = ""
+
+
+_OPENAI_COMPAT_SPECS = (
+    ("GROQ", "groq", "https://api.groq.com/openai/v1/chat/completions", "openai/gpt-oss-120b"),
+    ("OPENAI", "openai", "https://api.openai.com/v1/chat/completions", "gpt-4o-mini"),
+    ("OPENROUTER", "openrouter", "https://openrouter.ai/api/v1/chat/completions", "openai/gpt-4o-mini"),
+    ("MISTRAL", "mistral", "https://api.mistral.ai/v1/chat/completions", "mistral-small-latest"),
+    ("DEEPSEEK", "deepseek", "https://api.deepseek.com/v1/chat/completions", "deepseek-chat"),
+    ("TOGETHER", "together", "https://api.together.xyz/v1/chat/completions", "meta-llama/Llama-3.3-70B-Instruct-Turbo"),
+    ("XAI", "xai", "https://api.x.ai/v1/chat/completions", "grok-2-latest"),
+)
+
+
+def _collect_env_keys(prefix: str) -> list[str]:
+    """Collect single, comma-separated (<PREFIX>_API_KEYS), and numbered (<PREFIX>_API_KEY_1..N) keys."""
+    keys: list[str] = []
+    single = os.environ.get(f"{prefix}_API_KEY", "").strip()
+    if single:
+        keys.append(single)
+    multi = os.environ.get(f"{prefix}_API_KEYS", "").strip()
+    if multi:
+        keys.extend(k.strip() for k in multi.split(",") if k.strip())
+    numbered: list[tuple[int, str]] = []
+    pat = re.compile(rf"^{re.escape(prefix)}_API_KEY_(\d+)$")
+    for env_name, env_val in os.environ.items():
+        m = pat.match(env_name)
+        if m and env_val.strip():
+            numbered.append((int(m.group(1)), env_val.strip()))
+    for _, val in sorted(numbered, key=lambda x: x[0]):
+        keys.append(val)
+    # Preserve order while deduplicating identical keys
+    seen: set[str] = set()
+    out: list[str] = []
+    for k in keys:
+        if k not in seen:
+            seen.add(k)
+            out.append(k)
+    return out
+
+
+def discover_ai_providers(cfg: Config) -> list[AIProvider]:
+    """Discover all configured AI API keys (1, 2, 10, 25, or 100+) from environment variables."""
+    providers: list[AIProvider] = []
+
+    gemini_keys = _collect_env_keys("GEMINI")
+    for idx, key in enumerate(gemini_keys, 1):
+        name = "gemini" if idx == 1 else f"gemini_{idx}"
+        providers.append(AIProvider(name=name, kind="gemini", api_key=key, model=cfg.ai_model))
+
+    for prefix, slug, default_url, default_model in _OPENAI_COMPAT_SPECS:
+        model_override = cfg.groq_model if prefix == "GROQ" else os.environ.get(f"{prefix}_MODEL", "").strip() or default_model
+        url_override = os.environ.get(f"{prefix}_BASE_URL", "").strip() or default_url
+        keys = _collect_env_keys(prefix)
+        for idx, key in enumerate(keys, 1):
+            name = slug if idx == 1 else f"{slug}_{idx}"
+            providers.append(AIProvider(name=name, kind="openai_compat", api_key=key, model=model_override, url=url_override))
+
+    anthropic_keys = _collect_env_keys("ANTHROPIC")
+    anthropic_model = os.environ.get("ANTHROPIC_MODEL", "").strip() or "claude-3-5-haiku-latest"
+    for idx, key in enumerate(anthropic_keys, 1):
+        name = "anthropic" if idx == 1 else f"anthropic_{idx}"
+        providers.append(
+            AIProvider(
+                name=name,
+                kind="anthropic",
+                api_key=key,
+                model=anthropic_model,
+                url="https://api.anthropic.com/v1/messages",
+            )
+        )
+
+    # Custom OpenAI-compatible endpoints: CUSTOM_AI_KEY_1..N + CUSTOM_AI_URL_1..N
+    custom_pat = re.compile(r"^CUSTOM_AI_KEY_(\d+)$")
+    custom_idxs = sorted(int(m.group(1)) for k in os.environ if (m := custom_pat.match(k)) and os.environ[k].strip())
+    for idx in custom_idxs:
+        key = os.environ.get(f"CUSTOM_AI_KEY_{idx}", "").strip()
+        url = os.environ.get(f"CUSTOM_AI_URL_{idx}", "").strip()
+        model = os.environ.get(f"CUSTOM_AI_MODEL_{idx}", "").strip() or "gpt-4o-mini"
+        if key and url:
+            providers.append(AIProvider(name=f"custom_{idx}", kind="openai_compat", api_key=key, model=model, url=url))
+
+    return providers
 
 
 @dataclass
@@ -127,14 +218,19 @@ def _build_prompt(snippets: list[tuple[str, str]], stack_guidance: str = "") -> 
     files_block = "\n\n".join(f"=== FILE: {rel} ===\n{body}" for rel, body in snippets)
     stack_section = f"\nFRAMEWORK / STACK CONTEXT:\n{stack_guidance}\n" if stack_guidance else ""
     return (
-        "You are an expert application security reviewer. Inspect the provided code for ALL types of "
-        "security vulnerabilities and serious code bugs, including:\n"
+        "You are an expert application security reviewer. Complete ALL 5 security tasks below thoroughly — "
+        "do not skip any category:\n"
         f"{stack_section}"
-        "- Broken Access Control / IDOR / missing authentication or ownership checks\n"
-        "- Injection flaws (SQL injection, OS command injection, SSTI, XSS, NoSQL injection)\n"
-        "- SSRF (Server-Side Request Forgery) & Path Traversal\n"
-        "- Unsafe deserialization (pickle, yaml.load), weak cryptography, disabled TLS verification, hardcoded credentials\n"
-        "- Critical logic bugs, race conditions, or swallowed exceptions\n"
+        "TASK 1 (Access Control & Auth): Check every route/endpoint/form for Broken Access Control, IDOR, "
+        "missing authentication/ownership checks, privilege escalation, and missing CSRF protection.\n"
+        "TASK 2 (Injections & Traversal): Check for SQL injection, NoSQL injection, OS command injection, "
+        "SSTI, XSS, SSRF, and Path Traversal.\n"
+        "TASK 3 (Secrets, Crypto & Transport): Check for hardcoded credentials/API keys, weak cryptography "
+        "(MD5/SHA1), disabled TLS verification, insecure cookies, wildcard CORS, and debug mode enabled.\n"
+        "TASK 4 (Logic & Deserialization Bugs): Check for unsafe deserialization (pickle, yaml.load), "
+        "race conditions, swallowed exceptions, or critical business-logic bypasses.\n"
+        "TASK 5 (Explain Impact, Access & Fix): For every confirmed finding, state what happens if unfixed (`impact`), "
+        "how it can be accessed (`access_example`), and a concrete `remediation` (plus `patch_old`/`patch_new` when safe).\n"
         "Rules:\n"
         "- Inspect EVERY provided file and EVERY function/route/line from top to bottom.\n"
         "- Do NOT stop after finding an issue in one file — list ALL distinct vulnerabilities and serious bugs across ALL provided files.\n"
@@ -273,8 +369,15 @@ def _call_gemini(prompt: str, api_key: str, model: str, valid_files: set[str], s
     return _parse_verdict(text, valid_files, scanned_version)
 
 
-def _call_groq(prompt: str, api_key: str, model: str, valid_files: set[str], scanned_version: str, timeout: float) -> tuple[bool, list[Finding], str]:
-    url = "https://api.groq.com/openai/v1/chat/completions"
+def _call_openai_compat(
+    url: str,
+    prompt: str,
+    api_key: str,
+    model: str,
+    valid_files: set[str],
+    scanned_version: str,
+    timeout: float,
+) -> tuple[bool, list[Finding], str]:
     payload = {
         "model": model,
         "temperature": 0.1,
@@ -296,6 +399,84 @@ def _call_groq(prompt: str, api_key: str, model: str, valid_files: set[str], sca
     return _parse_verdict(text, valid_files, scanned_version)
 
 
+def _call_groq(prompt: str, api_key: str, model: str, valid_files: set[str], scanned_version: str, timeout: float) -> tuple[bool, list[Finding], str]:
+    return _call_openai_compat(
+        "https://api.groq.com/openai/v1/chat/completions",
+        prompt,
+        api_key,
+        model,
+        valid_files,
+        scanned_version,
+        timeout,
+    )
+
+
+def _call_anthropic(
+    url: str,
+    prompt: str,
+    api_key: str,
+    model: str,
+    valid_files: set[str],
+    scanned_version: str,
+    timeout: float,
+) -> tuple[bool, list[Finding], str]:
+    payload = {
+        "model": model,
+        "max_tokens": 2048,
+        "temperature": 0.1,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    resp = httpx.post(
+        url,
+        json=payload,
+        headers={
+            "Content-Type": "application/json",
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+        },
+        timeout=timeout,
+    )
+    resp.raise_for_status()
+    body = resp.json()
+    text = body["content"][0]["text"]
+    return _parse_verdict(text, valid_files, scanned_version)
+
+
+def _call_provider(
+    provider: AIProvider,
+    prompt: str,
+    valid_files: set[str],
+    scanned_version: str,
+    timeout: float,
+) -> tuple[bool, list[Finding], str]:
+    if provider.kind == "gemini":
+        return _call_gemini(prompt, provider.api_key, provider.model, valid_files, scanned_version, timeout)
+    if provider.kind == "anthropic":
+        return _call_anthropic(provider.url, prompt, provider.api_key, provider.model, valid_files, scanned_version, timeout)
+    return _call_openai_compat(provider.url, prompt, provider.api_key, provider.model, valid_files, scanned_version, timeout)
+
+
+def _build_multi_judge_prompt(
+    snippets: list[tuple[str, str]],
+    verdicts: list[tuple[str, bool, list[Finding], str]],
+) -> str:
+    files_block = "\n\n".join(f"=== FILE: {rel} ===\n{body}" for rel, body in snippets)
+    opinions = []
+    for pname, is_v, flist, reason in verdicts:
+        titles = ", ".join(f"{f.file}:{f.start_line} {f.title}" for f in flist[:6]) or "none"
+        opinions.append(f"- {pname}: is_vulnerable={is_v}, findings=[{titles}]\n  reasoning: {reason}")
+    opinions_block = "\n".join(opinions)
+    return (
+        "You are the final Consensus Judge synthesizing independent reviews from multiple AI security models.\n"
+        "Review their verdicts and reasoning below, verify against the actual provided code/data, and produce one "
+        "authoritative consensus JSON verdict.\n\n"
+        f"MODEL OPINIONS ({len(verdicts)}):\n{opinions_block}\n\n"
+        "Return ONLY a strict JSON object:\n"
+        '{"is_vulnerable": bool, "findings": [...], "reasoning": "2-3 sentence consensus explanation"}\n\n'
+        f"{files_block}"
+    )
+
+
 def _deduplicate_findings(findings: list[Finding]) -> list[Finding]:
     seen: set[tuple[str, int]] = set()
     merged: list[Finding] = []
@@ -314,18 +495,144 @@ def _attach_consensus(findings: list[Finding], status: str, trace: dict[str, str
     return findings
 
 
+def _run_n_provider_consensus(
+    providers: list[AIProvider],
+    snippets: list[tuple[str, str]],
+    scanned_version: str,
+    cfg: Config,
+    per_call_timeout: float,
+    stack_guidance: str,
+    emit,
+    start: float,
+) -> AIReviewResult:
+    """Run all N configured API keys/providers concurrently and synthesize a consensus verdict."""
+    valid_files = {rel for rel, _ in snippets}
+    files_list = ", ".join(sorted(valid_files))
+    prompt = _build_prompt(snippets, stack_guidance=stack_guidance)
+    question = f"Review {files_list} for security vulnerabilities, auth/IDOR gaps, and code bugs."
+    emit("ai_start", f"Multi-Key Consensus ({len(providers)} key(s)): {question}")
+
+    verdicts: list[tuple[AIProvider, bool, list[Finding], str]] = []
+    errors: list[tuple[AIProvider, str]] = []
+
+    def _ask(prov: AIProvider):
+        return prov, _call_provider(prov, prompt, valid_files, scanned_version, per_call_timeout)
+
+    with ThreadPoolExecutor(max_workers=min(12, len(providers))) as pool:
+        for prov, outcome in pool.map(
+            lambda p: _safe_call_provider(p, prompt, valid_files, scanned_version, per_call_timeout),
+            providers,
+        ):
+            if isinstance(outcome, str):
+                errors.append((prov, outcome))
+            else:
+                is_v, flist, reason = outcome
+                verdicts.append((prov, is_v, flist, reason))
+
+    if not verdicts:
+        ms = int((time.monotonic() - start) * 1000)
+        summary_err = "; ".join(f"{p.name}: {e}" for p, e in errors[:3])
+        return AIReviewResult("unavailable", [], f"All {len(providers)} AI key(s) failed ({summary_err})", ms)
+
+    trace: dict[str, str] = {"consensus_q": question}
+    for prov, is_v, flist, reason in verdicts:
+        trace[prov.name] = f"[{'VULNERABLE' if is_v else 'SAFE'} · {len(flist)} finding(s)] {reason}"
+    for prov, err in errors:
+        trace[prov.name] = f"fallback ({err})"
+
+    total_ok = len(verdicts)
+    vuln_votes = [v for v in verdicts if v[1]]
+    safe_votes = [v for v in verdicts if not v[1]]
+    ms = int((time.monotonic() - start) * 1000)
+
+    # Unanimous Safe
+    if not vuln_votes:
+        status = f"{total_ok}/{total_ok}_safe" if total_ok >= 2 else "single"
+        return AIReviewResult("ok", [], f"{total_ok}/{len(providers)} AI key(s) agreed: Safe", ms, status, trace)
+
+    # Unanimous Vulnerable (or single provider) -> merge findings
+    if not safe_votes:
+        merged = _deduplicate_findings([f for _, _, flist, _ in vuln_votes for f in flist])
+        status = f"{total_ok}/{total_ok}_vulnerable" if total_ok >= 2 else "single"
+        _attach_consensus(merged, status, trace)
+        return AIReviewResult("ok", merged, f"{total_ok}/{len(providers)} AI key(s) found {len(merged)} issue(s)", ms, status, trace)
+
+    # Disagreement among N providers -> Synthesis Judge using the first responding provider
+    judge_prov = verdicts[0][0]
+    judge_prompt = _build_multi_judge_prompt(
+        snippets,
+        [(p.name, is_v, flist, reason) for p, is_v, flist, reason in verdicts],
+    )
+    emit("ai_start", f"Consensus Judge ({judge_prov.name}) synthesizing {total_ok} opinions for {files_list}...")
+    try:
+        j_vuln, j_findings, j_reason = _call_provider(judge_prov, judge_prompt, valid_files, scanned_version, per_call_timeout)
+        trace["judge"] = j_reason
+        final_findings = j_findings if j_vuln else []
+        _attach_consensus(final_findings, "debate_resolved", trace)
+        ms = int((time.monotonic() - start) * 1000)
+        return AIReviewResult(
+            "ok",
+            final_findings,
+            f"Consensus Judge ({judge_prov.name}) synthesized {total_ok} AI opinions",
+            ms,
+            "debate_resolved",
+            trace,
+        )
+    except Exception as exc:
+        trace["judge"] = f"judge fallback ({type(exc).__name__}: {exc})"
+        merged = _deduplicate_findings([f for _, _, flist, _ in vuln_votes for f in flist]) if len(vuln_votes) >= len(safe_votes) else []
+        _attach_consensus(merged, "single_fallback", trace)
+        ms = int((time.monotonic() - start) * 1000)
+        return AIReviewResult("ok", merged, f"Majority vote across {total_ok} AI key(s)", ms, "single_fallback", trace)
+
+
+def _safe_call_provider(
+    prov: AIProvider,
+    prompt: str,
+    valid_files: set[str],
+    scanned_version: str,
+    timeout: float,
+):
+    try:
+        return prov, _call_provider(prov, prompt, valid_files, scanned_version, timeout)
+    except httpx.TimeoutException:
+        return prov, f"timed out after {timeout}s"
+    except httpx.HTTPStatusError as exc:
+        return prov, f"HTTP {exc.response.status_code}"
+    except Exception as exc:
+        return prov, f"{type(exc).__name__}: {exc}"
+
+
 def _review_batch(
     snippets: list[tuple[str, str]],
     scanned_version: str,
     cfg: Config,
-    gemini_key: str,
-    groq_key: str,
+    providers: list[AIProvider],
     per_call_timeout: float,
     use_consensus: bool,
     stack_guidance: str,
     emit,
     start: float,
 ) -> AIReviewResult:
+    # 3+ keys, or non-(Gemini+Groq) combinations -> dynamic N-provider parallel consensus + synthesis judge
+    is_classic_two_key = (
+        len(providers) == 2 and providers[0].name == "gemini" and providers[1].name == "groq"
+    )
+    if len(providers) >= 3 or (len(providers) >= 1 and not is_classic_two_key and providers[0].name != "gemini"):
+        return _run_n_provider_consensus(
+            providers, snippets, scanned_version, cfg, per_call_timeout, stack_guidance, emit, start
+        )
+    if len(providers) == 1 and not use_consensus:
+        # Classic single Gemini path
+        gemini_key = providers[0].api_key
+        groq_key = ""
+    elif is_classic_two_key:
+        gemini_key = providers[0].api_key
+        groq_key = providers[1].api_key
+    else:
+        gemini_key = providers[0].api_key
+        groq_key = ""
+
     valid_files = {rel for rel, _ in snippets}
     files_list = ", ".join(sorted(valid_files))
     prompt = _build_prompt(snippets, stack_guidance=stack_guidance)
@@ -333,7 +640,7 @@ def _review_batch(
     gemini_q = f"Are there any security vulnerabilities (auth/IDOR, injection, XSS, SSRF, crypto, secrets) or code bugs in {files_list}?"
     groq_q = f"Gemini reported Safe — double-check {files_list} for any hidden vulnerabilities or code bugs?"
 
-    if not use_consensus:
+    if not use_consensus or not groq_key:
         emit("ai_start", f"Layer 1 (Gemini) Q: {gemini_q}")
         try:
             _is_vuln, findings, reasoning = _call_gemini(prompt, gemini_key, cfg.ai_model, valid_files, scanned_version, per_call_timeout)
@@ -447,25 +754,23 @@ def run_ai_review(
     if not cfg.ai_enabled:
         return AIReviewResult("skipped", [], "AI review disabled (--no-ai or config)")
 
-    gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
-    groq_key = os.environ.get("GROQ_API_KEY", "").strip()
-    if not gemini_key:
-        return AIReviewResult("unavailable", [], "GEMINI_API_KEY not set; AI authorization review skipped")
+    providers = discover_ai_providers(cfg)
+    if not providers:
+        return AIReviewResult("unavailable", [], "No AI API keys set (e.g. GEMINI_API_KEY, GROQ_API_KEY, OPENAI_API_KEY); AI review skipped")
 
     batches = _select_batches(target, secret_findings, cfg)
     if not batches:
         return AIReviewResult("skipped", [], "no route/controller/auth-relevant code in staged changes")
 
     per_call_timeout = min(float(cfg.ai_timeout), LLM_CALL_TIMEOUT)
-    use_consensus = cfg.consensus_enabled or bool(gemini_key and groq_key)
+    use_consensus = cfg.consensus_enabled or len(providers) >= 2
 
     if len(batches) == 1:
         return _review_batch(
             batches[0],
             target.version,
             cfg,
-            gemini_key,
-            groq_key,
+            providers,
             per_call_timeout,
             use_consensus,
             stack_guidance,
@@ -474,22 +779,30 @@ def run_ai_review(
         )
 
     total_files = sum(len(b) for b in batches)
-    with ThreadPoolExecutor(max_workers=min(4, len(batches))) as pool:
+    # When 3+ keys are available across multiple batches, rotate a multi-key quorum per batch
+    # so all keys work together in parallel without exhausting rate limits on a single key.
+    def _providers_for_batch(batch_idx: int) -> list[AIProvider]:
+        if len(providers) <= 3:
+            return providers
+        quorum_size = min(3, len(providers))
+        offset = (batch_idx * quorum_size) % len(providers)
+        return [providers[(offset + j) % len(providers)] for j in range(quorum_size)]
+
+    with ThreadPoolExecutor(max_workers=min(8, max(len(batches), len(providers)))) as pool:
         results = list(
             pool.map(
-                lambda b: _review_batch(
-                    b,
+                lambda item: _review_batch(
+                    item[1],
                     target.version,
                     cfg,
-                    gemini_key,
-                    groq_key,
+                    _providers_for_batch(item[0]),
                     per_call_timeout,
                     use_consensus,
                     stack_guidance,
                     emit,
                     start,
                 ),
-                batches,
+                enumerate(batches),
             )
         )
 
