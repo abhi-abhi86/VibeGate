@@ -57,21 +57,29 @@ if [ "$#" -gt 0 ]; then
   esac
 fi
 
-cat <<'EOF'
- __     ___ _           ____       _
- \ \   / (_) |__   ___ / ___| __ _| |_ ___
-  \ \ / /| | '_ \ / _ \ |  _ / _` | __/ _ \
-   \ V / | | |_) |  __/ |_| | (_| | ||  __/
-    \_/  |_|_.__/ \___|\____|\__,_|\__\___|
-                              by team Z-ZONE
-EOF
-echo "  1) Git repository URL (clones temporarily, scans all files, then deletes the clone)"
-echo "  2) Local project folder / downloaded directory"
-echo "  3) Single local file path (e.g. an unuploaded file on your system)"
-echo "  4) Activate automatic Git commit & push protection (all repos, no path needed)"
-echo "  5) Deactivate automatic Git commit & push protection"
-echo "  6) Hosted domain / live URL security audit (HTTPS, headers, cookies, CORS, exposures)"
-echo ""
+"$VENV_DIR/bin/python" - <<'PY'
+from rich import box
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+from vibegate.ui import print_banner
+
+console = Console()
+print_banner(console)
+
+menu = Table.grid(padding=(0, 2))
+menu.add_column(style="bold cyan", justify="right", no_wrap=True)
+menu.add_column(style="bold white", no_wrap=True)
+menu.add_column(style="dim")
+menu.add_row("1)", "Git Repository URL", "Clone temporarily, scan all files, then delete clone")
+menu.add_row("2)", "Local Project Folder", "Scan a local or downloaded directory")
+menu.add_row("3)", "Single Local File", "Scan an unuploaded file on your system")
+menu.add_row("4)", "Enable Git Protection", "Activate automatic pre-commit & pre-push hooks globally")
+menu.add_row("5)", "Disable Git Protection", "Deactivate global pre-commit & pre-push hooks")
+menu.add_row("6)", "Hosted Website Audit", "Check live domain (.com/.in) TLS, headers, JS bundles & exposures")
+
+console.print(Panel(menu, title="[bold magenta]Choose a Target or Action[/bold magenta]", box=box.ROUNDED, border_style="cyan", expand=False))
+PY
 printf "Choose [1-6] or paste a Git URL / domain / path: "
 IFS= read -r CHOICE
 CHOICE="$(printf '%s' "$CHOICE" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"

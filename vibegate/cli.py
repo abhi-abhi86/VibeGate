@@ -35,6 +35,12 @@ exec vibegate scan --push
 
 def _run_scan(args: argparse.Namespace, progress_cb) -> "ScanReport | int":
     target = (args.repo or args.path).strip()
+    if getattr(args, "web_audit", False) or (not args.repo and is_web_target(target)):
+        cfg = load_config(None)
+        if args.fail_on:
+            cfg.fail_on = args.fail_on
+        return audit_domain(target, cfg, progress_cb=progress_cb, recheck_from=getattr(args, "recheck", None)), cfg
+
     if git.is_git_url(target):
         cfg = load_config(None)
         if args.fail_on:
@@ -48,12 +54,6 @@ def _run_scan(args: argparse.Namespace, progress_cb) -> "ScanReport | int":
         except git.GitError as exc:
             print(f"Error: {exc}", file=sys.stderr)
             return 2, cfg
-
-    if is_web_target(target):
-        cfg = load_config(None)
-        if args.fail_on:
-            cfg.fail_on = args.fail_on
-        return audit_domain(target, cfg, progress_cb=progress_cb), cfg
 
     cwd = os.path.abspath(target)
     if not os.path.exists(cwd):
@@ -415,6 +415,7 @@ def build_parser() -> argparse.ArgumentParser:
     audit.add_argument("--output", "-o", help="Save JSON audit report to a file")
     audit.add_argument("--report-md", help="Save human-readable Markdown security report to a file")
     audit.add_argument("--sarif", help="Save SARIF 2.1.0 report for GitHub Code Scanning / CI")
+    audit.add_argument("--recheck", help="Compare against a previous JSON report to verify which issues are fixed")
     audit.add_argument("--fail-on", choices=SEVERITIES, help="Override blocking severity threshold")
     audit.set_defaults(
         func=lambda a: cmd_scan(
@@ -435,7 +436,9 @@ def build_parser() -> argparse.ArgumentParser:
                 output=a.output,
                 report_md=a.report_md,
                 sarif=a.sarif,
+                recheck=a.recheck,
                 fail_on=a.fail_on,
+                web_audit=True,
             )
         )
     )
