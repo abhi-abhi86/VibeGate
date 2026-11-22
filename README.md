@@ -5,7 +5,6 @@
    \ V / | | |_) |  __/ |_| | (_| | ||  __/
     \_/  |_|_.__/ \___|\____|\__,_|\__\___|
  ⚡ Pre-Commit & Repo Security Gate • SAST · Secrets · SCA · 2-Layer AI
-    by team Z-ZONE
 ```
 
 # VibeGate
